@@ -1131,8 +1131,12 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
     out.append("")
     if energy_mismatch:
         out.append("综合判断：过程与账单电量/分时不一致，请复核后再确认结算。")
+        out.append("需到设备上核实相关数据，请设备方协助排查。")
         valid = False
-        verdict = "综合判断：过程与账单电量/分时不一致，请复核后再确认结算。"
+        verdict = (
+            "综合判断：过程与账单电量/分时不一致，请复核后再确认结算。\n"
+            "需到设备上核实相关数据，请设备方协助排查。"
+        )
     elif normal and not has_remote_stop and not offline and not fault:
         out.append("综合判断：充电情况正常，结算与结束原因合理。")
         valid = True
@@ -1143,8 +1147,12 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
         verdict = "综合判断：远程停止流程完整，结算数据可核对。"
     else:
         out.append("综合判断：请结合日志与现场情况复核。")
+        out.append("需到设备上核实相关数据，请设备方协助排查。")
         valid = False
-        verdict = "综合判断：请结合日志与现场情况复核。"
+        verdict = (
+            "综合判断：请结合日志与现场情况复核。\n"
+            "需到设备上核实相关数据，请设备方协助排查。"
+        )
 
     out += [
         "",

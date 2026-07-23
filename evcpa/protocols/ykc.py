@@ -85,15 +85,23 @@ class YkcParser(ProtocolParser):
 
     @staticmethod
     def _looks_like_ascii_pile(raw: bytes) -> bool:
-        if len(raw) < 10:
+        """蔚景帧特征：第 4 字节为 ASCII 设备编号长度，其后为可打印桩号。"""
+        if len(raw) < 12:
             return False
         ascii_len = raw[4]
-        if ascii_len < 5 or ascii_len > 32:
+        if ascii_len < 1 or ascii_len > 64:
             return False
-        if 5 + ascii_len > len(raw) - 2:
+        if 5 + ascii_len + 3 + 2 > len(raw):
             return False
-        pile = raw[5 : 5 + ascii_len]
-        return pile.isdigit()
+        pile = raw[5 : 5 + ascii_len].rstrip(b"\x00")
+        if not pile:
+            return False
+        if any(b < 0x20 or b > 0x7E for b in pile):
+            return False
+        # 蔚景消息体长度在桩号后第 2~3 字节（大端）
+        enc_off = 5 + ascii_len
+        body_len = int.from_bytes(raw[enc_off + 1 : enc_off + 3], "big")
+        return enc_off + 3 + body_len + 2 == len(raw)
 
     def parse(self, raw: bytes | None, json_obj: Any | None) -> AnalysisResult:
         if raw is None or len(raw) < 8:

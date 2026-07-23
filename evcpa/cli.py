@@ -52,11 +52,26 @@ def analyze(
         console.print("[red]请提供 --hex / --json / --file[/red]")
         raise typer.Exit(code=2)
 
-    result = agent.analyze(hex_text=payload_hex, json_text=payload_json, protocol=protocol)
+    data = agent.analyze_payload(hex_text=payload_hex, json_text=payload_json, protocol=protocol)
     if as_json:
-        console.print_json(json.dumps(result.to_pretty_dict(), ensure_ascii=False))
+        console.print_json(json.dumps(data, ensure_ascii=False))
         return
 
+    if data.get("mode") in ("charging_report", "multi_frame"):
+        lines = [data.get("summary") or data.get("conclusion") or ""]
+        if data.get("verdict"):
+            lines.append(str(data["verdict"]))
+        frames = (data.get("extras") or {}).get("frames") or []
+        if frames:
+            lines.append("")
+            lines.append(f"帧明细（{len(frames)}）:")
+            for i, fr in enumerate(frames, 1):
+                lines.append(f"  {i}. {fr.get('frame_type_name') or fr.get('frame_type')}: {fr.get('summary')}")
+        console.print(Panel("\n".join(lines), title="分析结果", border_style="cyan"))
+        return
+
+    # 单帧：还原 AnalysisResult 展示
+    result = agent.analyze(hex_text=payload_hex, json_text=payload_json, protocol=protocol)
     console.print(Panel(agent.explain(result), title="分析结果", border_style="cyan"))
     if result.extras.get("candidates"):
         table = Table(title="协议候选得分")

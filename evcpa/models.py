@@ -35,6 +35,8 @@ class ProtocolId(str, Enum):
     PHOENIX = "phoenix"
     LVTONG = "lvtong"
     ASCII68 = "ascii68"
+    WEIJING = "weijing"
+    WANMA = "wanma"
     UNKNOWN = "unknown"
 
 

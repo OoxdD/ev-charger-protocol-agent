@@ -408,6 +408,11 @@ textarea {
   font-size: 0.88rem;
 }
 
+#warnList li.followup {
+  background: color-mix(in srgb, var(--warn-bg) 70%, #fff);
+  font-weight: 600;
+}
+
 .table-wrap {
   border: 1px solid var(--line);
   border-radius: 12px;

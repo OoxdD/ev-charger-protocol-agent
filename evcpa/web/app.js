@@ -20,9 +20,28 @@
   const fieldBody = $("fieldBody");
   const candBlock = $("candBlock");
   const candList = $("candList");
+  const candTitle = $("candTitle");
 
   let inputMode = "auto";
   let lastResult = null;
+
+  const DEVICE_FOLLOWUP = "需到设备上核实相关数据，请设备方协助排查。";
+
+  function hasAbnormalResult(data) {
+    if (!data) return false;
+    if (data.valid === false) return true;
+    const warnings = data.warnings || [];
+    if (warnings.some((w) => w.level === "error" || w.level === "warn")) return true;
+    if (data.extras && data.extras.energy_mismatch) return true;
+    return false;
+  }
+
+  function withDeviceFollowup(text, data) {
+    const base = (text || "").trim();
+    if (!hasAbnormalResult(data)) return base;
+    if (base.includes("设备上核实") || base.includes("设备方协助")) return base;
+    return base ? `${base}\n${DEVICE_FOLLOWUP}` : DEVICE_FOLLOWUP;
+  }
 
   const FIELD_LABELS = {
     start_flag: "起始标志",
@@ -149,6 +168,12 @@
     return hit >= 2 || (text.includes("--socInfo:") && text.includes("--chargingInfo:"));
   }
 
+  function looksLikeProtocolTraceLog(text) {
+    const dirHit = (text.match(/【(?:上报|下发)\s*0x[0-9A-Fa-f]{2}】/g) || []).length;
+    const tsHit = (text.slice(0, 5000).match(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/g) || []).length;
+    return dirHit >= 2 && tsHit >= 1 && text.includes("68");
+  }
+
   function buildBody() {
     const text = payload.value.trim();
     if (!text) throw new Error("请先输入或导入报文内容");
@@ -156,6 +181,10 @@
     // 平台订单日志：整份文本交给后端抽取充电业务数据
     if (looksLikeOrderLog(text)) {
       return { text };
+    }
+    // 协议抓包日志：按行提取【上报/下发】帧，避免时间戳污染 hex
+    if (looksLikeProtocolTraceLog(text)) {
+      return { text, protocol: protocolSel.value || null };
     }
 
     const forced = protocolSel.value || null;
@@ -169,15 +198,9 @@
         body.json = text;
       }
     } else {
-      const frame = extractFirstHexFrame(text);
-      body.hex = frame || text;
+      body.hex = text;
     }
     return body;
-  }
-
-  function extractFirstHexFrame(text) {
-    const m = text.match(/68(?:[\s,]+[0-9A-Fa-f]{2}){6,}|68(?:[0-9A-Fa-f]{2}){8,}/);
-    return m ? m[0] : null;
   }
 
   function showEmpty() {
@@ -203,26 +226,36 @@
     copyBtn.hidden = false;
 
     const isCharge = data.mode === "charging_report";
+    const isMulti = data.mode === "multi_frame" || (data.extras && data.extras.frame_count > 1);
 
-    if (isCharge) {
+    if (isCharge || data.mode === "multi_frame") {
       const points = data.result_points || [];
       resultPoints.textContent = points.length
         ? points.join("\n")
-        : data.summary || data.conclusion || "已生成充电订单分析结果";
-      verdictText.textContent = data.verdict || "";
+        : data.summary || data.conclusion || "已生成分析结果";
+      verdictText.textContent = withDeviceFollowup(data.verdict || "", data);
 
       const pick = (name) => {
         const f = (data.fields || []).find((x) => x.name === name);
         return f ? f.value : "-";
       };
-      summaryGrid.innerHTML = [
-        card("充电桩", pick("充电桩编号")),
-        card("枪口", pick("枪口号")),
-        card("充电电量", pick("实际充电电量")),
-        card("费用合计", pick("费用合计")),
-        card("结束原因", pick("设备结束原因")),
-        card("状态", data.valid !== false ? "正常" : "需复核", data.valid !== false ? "ok" : "bad"),
-      ].join("");
+      if (isCharge) {
+        summaryGrid.innerHTML = [
+          card("充电桩", pick("充电桩编号")),
+          card("枪口", pick("枪口号")),
+          card("充电电量", pick("实际充电电量")),
+          card("费用合计", pick("费用合计")),
+          card("结束原因", pick("设备结束原因")),
+          card("状态", data.valid !== false ? "正常" : "需复核", data.valid !== false ? "ok" : "bad"),
+        ].join("");
+      } else {
+        summaryGrid.innerHTML = [
+          card("协议", data.protocol_name || data.protocol || "-"),
+          card("帧数", String((data.extras && data.extras.frame_count) || (data.fields || []).length)),
+          card("类型", data.frame_type_name || "多帧解析"),
+          card("校验", data.valid !== false ? "通过" : "异常", data.valid !== false ? "ok" : "bad"),
+        ].join("");
+      }
 
       fieldBody.innerHTML = (data.fields || [])
         .map(
@@ -231,10 +264,34 @@
             <td>${escapeHtml(fmtValue(f.value))}</td>
           </tr>`
         )
-        .join("") || `<tr><td colspan="2">无充电信息</td></tr>`;
+        .join("") || `<tr><td colspan="2">无信息</td></tr>`;
 
-      warnBlock.hidden = true;
-      candBlock.hidden = true;
+      // 多帧明细追加到字段表下方（告警区之上用 cand 区域展示帧列表）
+      const frames = (data.extras && data.extras.frames) || [];
+      if (frames.length) {
+        candBlock.hidden = false;
+        if (candTitle) candTitle.textContent = "帧明细";
+        candList.innerHTML = frames
+          .slice(0, 40)
+          .map((fr, i) => {
+            const title = escapeHtml(fr.frame_type_name || fr.frame_type || `帧${i + 1}`);
+            const ok = fr.valid !== false ? "ok" : "bad";
+            return `<div class="cand ${ok}">${i + 1}. ${title}<strong>${fr.valid !== false ? "有效" : "异常"}</strong></div>`;
+          })
+          .join("");
+      } else {
+        candBlock.hidden = true;
+      }
+
+      const chargeWarnings = data.warnings || [];
+      warnBlock.hidden = chargeWarnings.length === 0 && !hasAbnormalResult(data);
+      const warnItems = chargeWarnings.map(
+        (w) => `<li>[${escapeHtml(w.level || "info")}] ${escapeHtml(w.message || w.code || "")}</li>`
+      );
+      if (hasAbnormalResult(data)) {
+        warnItems.push(`<li class="followup">${escapeHtml(DEVICE_FOLLOWUP)}</li>`);
+      }
+      warnList.innerHTML = warnItems.join("");
       return;
     }
 
@@ -245,9 +302,12 @@
     const hasError = warnings.some((w) => w.level === "error");
     resultPoints.textContent = data.summary || data.conclusion || "无摘要";
     if (data.verdict) {
-      verdictText.textContent = data.verdict;
+      verdictText.textContent = withDeviceFollowup(data.verdict, data);
     } else if (!valid || hasError) {
-      verdictText.textContent = "综合判断：报文存在异常，请结合下方字段与告警核查。";
+      verdictText.textContent = withDeviceFollowup(
+        "综合判断：报文存在异常，请结合下方字段与告警核查。",
+        data
+      );
     } else if (conf >= 70) {
       verdictText.textContent = "综合判断：识别结果可信，报文解析正常。";
     } else {
@@ -261,13 +321,19 @@
       card("校验", valid ? "通过" : "异常", valid ? "ok" : "bad"),
     ].join("");
 
-    warnBlock.hidden = warnings.length === 0;
-    warnList.innerHTML = warnings
-      .map((w) => `<li>[${escapeHtml(w.level || "info")}] ${escapeHtml(w.message || w.code || "")}</li>`)
-      .join("");
+    const showFollowup = hasAbnormalResult(data) || (!valid || hasError);
+    warnBlock.hidden = warnings.length === 0 && !showFollowup;
+    const warnItems = warnings.map(
+      (w) => `<li>[${escapeHtml(w.level || "info")}] ${escapeHtml(w.message || w.code || "")}</li>`
+    );
+    if (showFollowup) {
+      warnItems.push(`<li class="followup">${escapeHtml(DEVICE_FOLLOWUP)}</li>`);
+    }
+    warnList.innerHTML = warnItems.join("");
 
     const cands = (data.extras && data.extras.candidates) || [];
     candBlock.hidden = cands.length === 0;
+    if (candTitle) candTitle.textContent = "协议候选得分";
     candList.innerHTML = cands
       .slice(0, 12)
       .map(([name, score]) => {
@@ -378,6 +444,7 @@
         verdict = "综合判断：已给出解析结果，但置信度偏低，建议人工复核。";
       }
     }
+    verdict = withDeviceFollowup(verdict, data);
 
     const lines = [
       "充电报文分析结果",
@@ -401,6 +468,16 @@
         const name = formatFieldName(f);
         const value = formatFieldValue(f);
         lines.push(`${name}：${value}`);
+      }
+    }
+
+    if (warnings.length || hasAbnormalResult(data)) {
+      lines.push("", "【告警 / 问题】");
+      for (const w of warnings) {
+        lines.push(`- [${w.level || "info"}] ${w.message || w.code || ""}`);
+      }
+      if (hasAbnormalResult(data) || !valid || errorWarnings.length) {
+        lines.push(`- ${DEVICE_FOLLOWUP}`);
       }
     }
 

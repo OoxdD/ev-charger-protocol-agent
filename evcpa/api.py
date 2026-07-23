@@ -70,5 +70,19 @@ def analyze(req: AnalyzeRequest) -> dict[str, Any]:
             import json
 
             json_text = json.dumps(req.json_payload, ensure_ascii=False)
-    result = agent.analyze(hex_text=req.hex, json_text=json_text, protocol=req.protocol)
-    return result.to_pretty_dict()
+
+    # 协议抓包日志（含【上报/下发】）走 text；纯 hex 走 hex
+    from evcpa.protocol_log import looks_like_protocol_trace_log
+
+    text_blob = req.text
+    hex_blob = req.hex
+    if hex_blob and looks_like_protocol_trace_log(hex_blob):
+        text_blob = hex_blob
+        hex_blob = None
+
+    return agent.analyze_payload(
+        hex_text=hex_blob,
+        json_text=json_text,
+        text=text_blob,
+        protocol=req.protocol,
+    )

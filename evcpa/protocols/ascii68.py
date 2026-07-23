@@ -23,7 +23,7 @@ _CMD_NAMES = {
 
 
 class Ascii68Parser(ProtocolParser):
-    """ASCII 桩号二进制协议（68 开头，桩号为数字字符串，常见于运营平台日志）。"""
+    """ASCII 桩号二进制协议（兼容旧日志；结构接近蔚景，CRC 不明时作兜底）。"""
 
     protocol_id = ProtocolId.ASCII68
     protocol_name = "ASCII桩号协议"
@@ -34,6 +34,18 @@ class Ascii68Parser(ProtocolParser):
         pile = self._extract_pile(raw)
         if not pile:
             return 0.0
+        # 若完整符合蔚景头+CRC16-XMODEM，则让位给 WeijingParser
+        from evcpa.utils import crc16_xmodem, read_u16_be
+
+        n = raw[4]
+        enc_off = 5 + n
+        if enc_off + 3 + 2 <= len(raw):
+            body_len = read_u16_be(raw, enc_off + 1)
+            end = enc_off + 3 + body_len
+            if end + 2 == len(raw):
+                if crc16_xmodem(raw[:end]) == read_u16_be(raw, end):
+                    return 0.2
+
         score = 0.72
         cmd = raw[1]
         if cmd in _CMD_NAMES or (cmd & 0x7F) in {0x0C, 0x06, 0x09, 0x08, 0x24, 0x26}:

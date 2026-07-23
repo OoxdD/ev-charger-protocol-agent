@@ -29,14 +29,18 @@ from evcpa.protocols.vendors_extra import (
     YouyichongParser,
     ZhichongParser,
 )
+from evcpa.protocols.wanma import WanmaParser
+from evcpa.protocols.weijing import WeijingParser
 from evcpa.protocols.xingxing import XingxingParser
 from evcpa.protocols.ykc import YkcParser
 
 
 def all_parsers() -> list[ProtocolParser]:
     return [
-        # 主流 / 二进制敏感协议优先
+        # 主流 / 二进制敏感协议优先（蔚景与云快充均 0x68，靠头结构区分）
+        WeijingParser(),
         YkcParser(),
+        WanmaParser(),
         Ascii68Parser(),
         OcppParser(),
         Iec104Parser(),
@@ -70,6 +74,8 @@ def all_parsers() -> list[ProtocolParser]:
 
 __all__ = [
     "ProtocolParser",
+    "WeijingParser",
+    "WanmaParser",
     "YkcParser",
     "XingxingParser",
     "ShenghongParser",

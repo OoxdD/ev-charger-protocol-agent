@@ -81,3 +81,37 @@ def crc16_modbus(data: bytes) -> int:
             else:
                 crc >>= 1
     return crc & 0xFFFF
+
+
+def crc16_xmodem(data: bytes) -> int:
+    """CRC-16/XMODEM (poly 0x1021, init 0), used by 蔚景科技协议."""
+    crc = 0x0000
+    poly = 0x1021
+    for b in data:
+        for i in range(8):
+            bit = ((b >> (7 - i)) & 1) == 1
+            c15 = ((crc >> 15) & 1) == 1
+            crc = (crc << 1) & 0xFFFF
+            if c15 ^ bit:
+                crc ^= poly
+    return crc & 0xFFFF
+
+
+def crc32_iso_hdlc(data: bytes) -> int:
+    """CRC-32/ISO-HDLC (zlib)，万马协议优先候选。"""
+    import zlib
+
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def crc32_mpeg2(data: bytes) -> int:
+    """CRC-32/MPEG-2（不反射、xorout=0），万马备选。"""
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc ^= b << 24
+        for _ in range(8):
+            if crc & 0x80000000:
+                crc = ((crc << 1) ^ 0x04C11DB7) & 0xFFFFFFFF
+            else:
+                crc = (crc << 1) & 0xFFFFFFFF
+    return crc & 0xFFFFFFFF

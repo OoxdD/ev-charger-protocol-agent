@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from .alarms import COMMON_ALARM_HINTS, VENDOR_STATUS_MAP
+from .wanma import PROTOCOL_VERSION as WANMA_PROTOCOL_VERSION
+from .wanma import WANMA_MSGS
+from .weijing import PROTOCOL_VERSION as WEIJING_PROTOCOL_VERSION
+from .weijing import WEIJING_CMDS
 from .ykc import (
     PROTOCOL_VERSION,
     YKC_APPLY_START_WAY,
@@ -15,6 +19,10 @@ __all__ = [
     "COMMON_ALARM_HINTS",
     "VENDOR_STATUS_MAP",
     "PROTOCOL_VERSION",
+    "WEIJING_PROTOCOL_VERSION",
+    "WEIJING_CMDS",
+    "WANMA_PROTOCOL_VERSION",
+    "WANMA_MSGS",
     "YKC_APPLY_START_WAY",
     "YKC_AUTH_FAIL_REASON",
     "YKC_FRAME_TYPES",
