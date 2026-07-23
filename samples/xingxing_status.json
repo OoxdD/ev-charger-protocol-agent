@@ -1,0 +1,9 @@
+{
+  "OperatorID": "MA1Y7X7X9",
+  "ConnectorStatusInfo": {
+    "ConnectorID": "3201020001001",
+    "Status": 2
+  },
+  "cmd": "notify_connector_status",
+  "deviceId": "3201020001"
+}

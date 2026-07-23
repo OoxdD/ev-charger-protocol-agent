@@ -1,0 +1,9 @@
+{
+  "typeId": 100,
+  "cot": 6,
+  "commonAddress": 1,
+  "ioa": 0,
+  "asdu": "C_IC_NA_1",
+  "protocol": "iec104",
+  "apdu": "68 0E 00 00 00 00 64 01 06 00 01 00 00 00"
+}

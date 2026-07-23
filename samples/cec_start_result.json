@@ -1,0 +1,7 @@
+{
+  "StartChargeSeq": "MA123456789012345678901234567890",
+  "StartChargeSeqStat": 1,
+  "ConnectorID": "3201020001001",
+  "SuccStat": 0,
+  "cmd": "notification_start_charge_result"
+}

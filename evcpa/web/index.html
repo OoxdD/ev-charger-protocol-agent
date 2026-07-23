@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>充电桩报文分析</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="bg" aria-hidden="true"></div>
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <div class="mark" aria-hidden="true"></div>
+        <div>
+          <h1>充电桩报文分析</h1>
+          <p class="tagline">粘贴或导入报文，自动识别协议并解读字段</p>
+        </div>
+      </div>
+      <div class="meta" id="protocolCount">协议加载中…</div>
+    </header>
+
+    <main class="layout">
+      <section class="panel input-panel">
+        <div class="panel-head">
+          <h2>输入报文</h2>
+          <div class="tabs" role="tablist">
+            <button type="button" class="tab active" data-mode="auto">自动识别</button>
+            <button type="button" class="tab" data-mode="hex">十六进制</button>
+            <button type="button" class="tab" data-mode="json">JSON</button>
+          </div>
+        </div>
+
+        <label class="field">
+          <span>协议（可选强制）</span>
+          <select id="protocol">
+            <option value="">自动识别</option>
+          </select>
+        </label>
+
+        <label class="field grow">
+          <span>报文内容</span>
+          <textarea id="payload" spellcheck="false" placeholder="可直接导入平台订单日志（含 socInfo / chargingInfo / recordInfo），自动生成充电业务报告&#10;&#10;也可粘贴单条十六进制或 JSON 报文做协议解析"></textarea>
+        </label>
+
+        <div class="actions">
+          <label class="file-btn">
+            <input type="file" id="file" accept=".hex,.json,.txt,.log,.csv,text/plain,application/json" />
+            导入文件
+          </label>
+          <button type="button" class="btn ghost" id="clearBtn">清空</button>
+          <button type="button" class="btn primary" id="analyzeBtn">开始分析</button>
+        </div>
+        <p class="hint" id="fileHint"></p>
+      </section>
+
+      <section class="panel result-panel">
+        <div class="panel-head">
+          <h2>分析结果</h2>
+          <button type="button" class="btn ghost small" id="copyBtn" hidden>分享结果</button>
+        </div>
+
+        <div id="emptyState" class="empty">
+          <p>在左侧输入或导入报文后点击「开始分析」</p>
+        </div>
+
+        <div id="errorState" class="error" hidden></div>
+
+        <div id="resultView" hidden>
+          <div class="block">
+            <h3>结果</h3>
+            <div id="resultPoints" class="result-points"></div>
+            <p id="verdictText" class="verdict-text"></p>
+          </div>
+          <div class="block">
+            <h3>充电信息</h3>
+            <div class="summary-grid" id="summaryGrid"></div>
+            <div class="table-wrap info-table">
+              <table>
+                <thead>
+                  <tr>
+                    <th>项目</th>
+                    <th>数值</th>
+                  </tr>
+                </thead>
+                <tbody id="fieldBody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="block" id="warnBlock" hidden>
+            <h3>告警 / 问题</h3>
+            <ul id="warnList"></ul>
+          </div>
+          <div class="block" id="candBlock" hidden>
+            <h3>协议候选得分</h3>
+            <div class="cands" id="candList"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <span>本地分析服务 · 数据不上传第三方</span>
+    </footer>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

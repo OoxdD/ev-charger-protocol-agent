@@ -1,0 +1,11 @@
+{
+  "productId": "FusionCharge_DC",
+  "deviceId": "HW-CHG-00088",
+  "serviceId": "ChargeService",
+  "eventType": "chargerStatusChanged",
+  "properties": {
+    "chargerStatus": "Charging",
+    "connectorId": "1",
+    "meterValue": 15.2
+  }
+}

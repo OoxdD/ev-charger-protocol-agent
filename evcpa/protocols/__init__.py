@@ -1,0 +1,83 @@
+from __future__ import annotations
+
+from evcpa.protocols.ascii68 import Ascii68Parser
+from evcpa.protocols.base import ProtocolParser
+from evcpa.protocols.cec import CecParser
+from evcpa.protocols.huawei import HuaweiParser
+from evcpa.protocols.iec104 import Iec104Parser
+from evcpa.protocols.infypower import InfypowerParser
+from evcpa.protocols.ocpp import OcppParser
+from evcpa.protocols.shenghong import ShenghongParser
+from evcpa.protocols.vendors_extra import (
+    AbbParser,
+    AnyueParser,
+    AonengParser,
+    CsgParser,
+    DakuyunParser,
+    EverchargeParser,
+    KamaisiParser,
+    KehuaParser,
+    KstarParser,
+    LvtongParser,
+    NariParser,
+    PhoenixParser,
+    PutianParser,
+    SgccParser,
+    TeldParser,
+    WallboxParser,
+    XiaojuParser,
+    YouyichongParser,
+    ZhichongParser,
+)
+from evcpa.protocols.xingxing import XingxingParser
+from evcpa.protocols.ykc import YkcParser
+
+
+def all_parsers() -> list[ProtocolParser]:
+    return [
+        # 主流 / 二进制敏感协议优先
+        YkcParser(),
+        Ascii68Parser(),
+        OcppParser(),
+        Iec104Parser(),
+        CecParser(),
+        XingxingParser(),
+        ShenghongParser(),
+        HuaweiParser(),
+        InfypowerParser(),
+        # 运营商 / 厂商
+        TeldParser(),
+        SgccParser(),
+        CsgParser(),
+        XiaojuParser(),
+        AonengParser(),
+        PutianParser(),
+        KehuaParser(),
+        KstarParser(),
+        AbbParser(),
+        EverchargeParser(),
+        KamaisiParser(),
+        DakuyunParser(),
+        YouyichongParser(),
+        NariParser(),
+        ZhichongParser(),
+        AnyueParser(),
+        WallboxParser(),
+        PhoenixParser(),
+        LvtongParser(),
+    ]
+
+
+__all__ = [
+    "ProtocolParser",
+    "YkcParser",
+    "XingxingParser",
+    "ShenghongParser",
+    "HuaweiParser",
+    "InfypowerParser",
+    "OcppParser",
+    "CecParser",
+    "Iec104Parser",
+    "Ascii68Parser",
+    "all_parsers",
+]

@@ -1,0 +1,9 @@
+{
+  "moduleId": "M01",
+  "moduleSn": "INFY-RECT-1001",
+  "moduleStatus": 2,
+  "dcVoltage": 750.5,
+  "dcCurrent": 40.0,
+  "faultCode": 0,
+  "infypower": true
+}

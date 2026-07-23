@@ -1,0 +1,11 @@
+{
+  "pileCode": "3701010001",
+  "gunNo": 1,
+  "chargeStatus": 2,
+  "soc": 56,
+  "outVoltage": 387.5,
+  "outCurrent": 80.2,
+  "totalPower": 12.3,
+  "vendor": "teld",
+  "cmd": "realtime_data"
+}

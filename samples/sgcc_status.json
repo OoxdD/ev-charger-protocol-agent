@@ -1,0 +1,9 @@
+{
+  "equipId": "SGCC-PILE-00088",
+  "gunId": 1,
+  "workStatus": 2,
+  "meterValue": 10234.5,
+  "aPhaseVoltage": 232.1,
+  "operator": "sgcc",
+  "msgType": "yc_report"
+}
