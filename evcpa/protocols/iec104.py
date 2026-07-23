@@ -78,7 +78,23 @@ class Iec104Parser(ProtocolParser):
                 calc = crc16_modbus(raw[2:-2])
                 recv = int.from_bytes(raw[-2:], "little")
                 ykc_type = raw[5]
-                if calc == recv and ykc_type in {0x01, 0x02, 0x03, 0x04, 0x13, 0x33, 0x34, 0x3B, 0x40, 0x55, 0x56}:
+                if calc == recv and ykc_type in {
+                    0x01,
+                    0x02,
+                    0x03,
+                    0x04,
+                    0x13,
+                    0x31,
+                    0x33,
+                    0x34,
+                    0x35,
+                    0x36,
+                    0x3B,
+                    0x3D,
+                    0x40,
+                    0x55,
+                    0x56,
+                }:
                     return 0.05
             except Exception:
                 pass

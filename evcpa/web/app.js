@@ -30,16 +30,42 @@
     seq: "序列号",
     encrypt_flag: "加密标志",
     frame_type: "帧类型",
+    protocol_version: "协议版本",
     body: "消息体",
-    crc16: "CRC校验",
-    crc16_calc: "计算CRC",
+    body_hex: "消息体十六进制",
+    crc16: "帧校验",
+    crc16_calc: "计算校验",
     pile_code: "桩编号",
     pile_type: "桩类型",
+    gun_count: "充电枪数量",
     gun_no: "枪号",
+    gun_status: "枪状态",
     status: "状态",
+    trade_no: "交易流水号",
+    txn_id: "交易流水号",
+    gun_homed: "枪是否归位",
+    gun_plugged: "是否插枪",
+    output_voltage: "输出电压",
+    output_current: "输出电流",
+    output_power: "输出功率",
     voltage: "电压",
     current: "电流",
-    txn_id: "交易流水号",
+    gun_cable_temp: "枪线温度",
+    gun_cable_code: "枪线编码",
+    soc: "SOC",
+    battery_max_temp: "电池组最高温度",
+    charge_time_min: "累计充电时间",
+    remain_time_min: "剩余时间",
+    charge_energy: "充电度数",
+    loss_energy: "计损充电度数",
+    charged_amount: "已充金额",
+    hardware_fault: "硬件故障",
+    start_way: "启动方式",
+    vin: "VIN码",
+    balance: "账户余额",
+    physical_card: "物理卡号",
+    logic_card: "逻辑卡号",
+    stop_reason: "停止原因",
     raw: "原始数据",
     messageTypeId: "消息类型",
     messageId: "消息ID",
@@ -51,9 +77,29 @@
     cot: "传送原因",
   };
 
+  function formatFieldName(f) {
+    if (f.display_name) return f.display_name;
+    if (f.label) return `${f.label}（${f.name}）`;
+    const cn = FIELD_LABELS[f.name];
+    if (cn) return `${cn}（${f.name}）`;
+    if (/[\u4e00-\u9fff]/.test(String(f.name || ""))) return f.name;
+    return f.name || "-";
+  }
+
+  function formatFieldValue(f) {
+    // 例：19.8 A；枚举释义仅在与中文名不同时追加，如「3 充电中」
+    let text = fmtValue(f.value);
+    if (f.unit) text += ` ${f.unit}`;
+    const cn = f.label || FIELD_LABELS[f.name];
+    if (f.meaning && (!cn || f.meaning !== cn)) {
+      text += ` ${f.meaning}`;
+    }
+    return text;
+  }
+
   function labelField(name) {
     if (!name) return "-";
-    if (FIELD_LABELS[name]) return FIELD_LABELS[name];
+    if (FIELD_LABELS[name]) return `${FIELD_LABELS[name]}（${name}）`;
     if (/[\u4e00-\u9fff]/.test(name)) return name;
     return name;
   }
@@ -234,10 +280,8 @@
       ? (data.fields || [])
           .map(
             (f) => `<tr>
-              <td>${escapeHtml(labelField(f.name))}</td>
-              <td>${escapeHtml(fmtValue(f.value))}${f.unit ? " " + escapeHtml(f.unit) : ""}${
-                f.meaning ? `（${escapeHtml(f.meaning)}）` : ""
-              }</td>
+              <td>${escapeHtml(formatFieldName(f))}</td>
+              <td>${escapeHtml(formatFieldValue(f))}</td>
             </tr>`
           )
           .join("")
@@ -354,10 +398,9 @@
     if (fields.length) {
       lines.push("", "【关键字段】");
       for (const f of fields) {
-        const name = labelField(f.name);
-        const value = fmtValue(f.value) + (f.unit ? ` ${f.unit}` : "");
-        const meaning = f.meaning ? `（${f.meaning}）` : "";
-        lines.push(`${name}：${value}${meaning}`);
+        const name = formatFieldName(f);
+        const value = formatFieldValue(f);
+        lines.push(`${name}：${value}`);
       }
     }
 

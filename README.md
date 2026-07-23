@@ -6,7 +6,7 @@
 
 | 协议 | 标识 | 典型形态 |
 |------|------|----------|
-| 云快充 | `ykc` | TCP 二进制帧 `0x68` + CRC16 |
+| 云快充 | `ykc` | TCP 二进制帧 `0x68` + CRC16（**平台协议 V1.7**） |
 | 星星充电 | `xingxing` | JSON / MQTT 业务报文 |
 | 盛宏 | `shenghong` | 二进制帧 / ASCII 扩展 |
 | 华为 | `huawei` | JSON IoT / FusionCharge 风格 |

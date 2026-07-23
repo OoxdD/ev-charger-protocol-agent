@@ -121,9 +121,7 @@ class ProtocolAgent:
         if result.fields:
             lines.append("关键字段:")
             for f in result.fields[:30]:
-                extra = f" ({f.meaning})" if f.meaning else ""
-                unit = f" {f.unit}" if f.unit else ""
-                lines.append(f"  - {f.name}: {f.value}{unit}{extra}")
+                lines.append(f"  - {f.display_name}: {f.display_value()}")
             if len(result.fields) > 30:
                 lines.append(f"  ... 另有 {len(result.fields) - 30} 个字段")
         return "\n".join(lines)

@@ -58,6 +58,34 @@ def test_ykc_login_sample():
     assert pile.value.startswith("320102")
 
 
+def test_ykc_v17_realtime_full_fields():
+    """V1.7 0x13 应完整解析电压电流 SOC 等字段。"""
+    agent = ProtocolAgent()
+    hx = (
+        "684000000013202509145201010126072200204915322025091452010101"
+        "030201F40DC600520000000000000000125400000000500000000000000000000000000002BE"
+    )
+    result = agent.analyze_hex(hx)
+    assert result.protocol == ProtocolId.YKC
+    assert result.frame_type == "0x13"
+    assert result.valid is True
+    by_name = {f.name: f for f in result.fields}
+    assert by_name["trade_no"].value.startswith("20250914520101")
+    assert by_name["status"].meaning == "充电"
+    assert by_name["output_voltage"].value == 357.2
+    assert by_name["output_current"].value == 19.8
+    assert by_name["soc"].value == 18
+    assert result.protocol_name == "云快充"
+
+
+def test_ykc_frame_type_table_v17():
+    from evcpa.knowledge.ykc import YKC_FRAME_TYPES
+
+    assert YKC_FRAME_TYPES[0x31][0].startswith("充电桩主动申请")
+    assert YKC_FRAME_TYPES[0x3D][0] == "交易记录"
+    assert YKC_FRAME_TYPES[0x34][0].startswith("运营平台远程控制启机")
+
+
 def test_ykc_crc():
     raw = parse_hex((SAMPLES / "ykc_heartbeat.hex").read_text(encoding="utf-8"))
     assert crc16_modbus(raw[2:-2]) == int.from_bytes(raw[-2:], "little")

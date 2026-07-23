@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class ProtocolId(str, Enum):
@@ -44,8 +44,26 @@ class FieldItem(BaseModel):
     offset: int | None = None
     length: int | None = None
     unit: str | None = None
+    label: str | None = None  # 中文名，展示为「中文（name）」
     meaning: str | None = None
     raw: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_name(self) -> str:
+        """页面/报告展示名：输出电流（output_current）。"""
+        if self.label:
+            return f"{self.label}（{self.name}）"
+        return self.name
+
+    def display_value(self) -> str:
+        """数值 + 单位，如：19.8 A；枚举释义仅在与中文名不同时追加。"""
+        text = "-" if self.value is None else str(self.value)
+        if self.unit:
+            text = f"{text} {self.unit}"
+        if self.meaning and (not self.label or self.meaning != self.label):
+            text = f"{text} {self.meaning}"
+        return text
 
 
 class WarningItem(BaseModel):
