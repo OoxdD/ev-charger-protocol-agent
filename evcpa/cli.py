@@ -34,6 +34,12 @@ def analyze(
     protocol: Optional[str] = typer.Option(
         None, "--protocol", "-p", help="强制协议 ID，见 `evcpa protocols`"
     ),
+    service_id: Optional[str] = typer.Option(
+        None, "--service-id", help="服务ID(service_Id)，多订单时筛选"
+    ),
+    trade_no: Optional[str] = typer.Option(
+        None, "--trade-no", help="流水号(tradeNo)，多订单时筛选"
+    ),
     as_json: bool = typer.Option(False, "--as-json", help="以 JSON 输出结果"),
 ) -> None:
     """分析一条充电桩报文。"""
@@ -52,12 +58,18 @@ def analyze(
         console.print("[red]请提供 --hex / --json / --file[/red]")
         raise typer.Exit(code=2)
 
-    data = agent.analyze_payload(hex_text=payload_hex, json_text=payload_json, protocol=protocol)
+    data = agent.analyze_payload(
+        hex_text=payload_hex,
+        json_text=payload_json,
+        protocol=protocol,
+        service_id=service_id,
+        trade_no=trade_no,
+    )
     if as_json:
         console.print_json(json.dumps(data, ensure_ascii=False))
         return
 
-    if data.get("mode") in ("charging_report", "multi_frame"):
+    if data.get("mode") in ("charging_report", "multi_frame", "multi_order_choice"):
         lines = [data.get("summary") or data.get("conclusion") or ""]
         if data.get("verdict"):
             lines.append(str(data["verdict"]))
@@ -69,7 +81,6 @@ def analyze(
                 lines.append(f"  {i}. {fr.get('frame_type_name') or fr.get('frame_type')}: {fr.get('summary')}")
         console.print(Panel("\n".join(lines), title="分析结果", border_style="cyan"))
         return
-
     # 单帧：还原 AnalysisResult 展示
     result = agent.analyze(hex_text=payload_hex, json_text=payload_json, protocol=protocol)
     console.print(Panel(agent.explain(result), title="分析结果", border_style="cyan"))

@@ -29,6 +29,8 @@ class AnalyzeRequest(BaseModel):
     json_payload: Optional[Any] = Field(None, alias="json", description="JSON 对象或字符串")
     text: Optional[str] = Field(None, description="原始文本/平台日志")
     protocol: Optional[str] = Field(None, description="强制协议 id")
+    service_id: Optional[str] = Field(None, description="服务ID(service_Id)，可选，用于多订单筛选")
+    trade_no: Optional[str] = Field(None, description="流水号(tradeNo)，可选，用于多订单筛选")
 
     model_config = {"populate_by_name": True}
 
@@ -60,7 +62,9 @@ def analyze(req: AnalyzeRequest) -> dict[str, Any]:
     if not blob and isinstance(req.json_payload, str) and looks_like_order_log(req.json_payload):
         blob = req.json_payload
     if blob and looks_like_order_log(blob):
-        return analyze_order_log(blob)
+        return analyze_order_log(
+            blob, service_id=req.service_id, trade_no=req.trade_no
+        )
 
     json_text = None
     if req.json_payload is not None:
@@ -85,4 +89,6 @@ def analyze(req: AnalyzeRequest) -> dict[str, Any]:
         json_text=json_text,
         text=text_blob,
         protocol=req.protocol,
+        service_id=req.service_id,
+        trade_no=req.trade_no,
     )

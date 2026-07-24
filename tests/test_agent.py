@@ -110,6 +110,43 @@ def test_weijing_heartbeat_sample():
     assert crc16_xmodem(raw[:-2]) == int.from_bytes(raw[-2:], "big")
 
 
+def test_weijing_bill_0x08_energy_wan_fen():
+    """0x08 账单电量/金额固定万分位：15650 → 1.565（不受精度字节影响）。"""
+    from evcpa.protocols.weijing import WeijingParser
+    from evcpa.utils import crc16_xmodem
+
+    def u32be(v: int) -> bytes:
+        return int(v).to_bytes(4, "big")
+
+    body = bytearray()
+    body += b"\x01"
+    body += b"ORD1234567890123"
+    body += b"\x02"
+    body += b"\x00" * 16
+    body += b"\x00" * 17
+    body += b"\x50"
+    body += bytes.fromhex("260724120000")
+    body += bytes.fromhex("260724130000")
+    body += b"\x02"  # 帧内精度字节为 2，解析仍按万分位
+    body += u32be(15650)
+    body += u32be(0) * 4
+    body += u32be(15650)
+    body += u32be(0) * 3
+
+    pile = b"1234567890"
+    hdr = bytearray([0x68, 0x08, 0x00, 0x01, len(pile)]) + pile + bytes([0x00])
+    hdr += len(body).to_bytes(2, "big") + body
+    frame = bytes(hdr) + crc16_xmodem(hdr).to_bytes(2, "big")
+
+    result = WeijingParser().parse(frame, None)
+    assert result.frame_type == "0x08"
+    assert result.valid is True
+    by_name = {f.name: f for f in result.fields}
+    assert by_name["charge_energy"].value == 1.565
+    assert by_name["charge_money"].value == 1.565
+    assert by_name["charge_energy"].unit == "kWh"
+
+
 def test_weijing_login_sample():
     agent = ProtocolAgent()
     hx = (SAMPLES / "weijing_login.hex").read_text(encoding="utf-8")

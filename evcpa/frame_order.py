@@ -6,6 +6,11 @@ from collections import defaultdict
 from typing import Any
 
 from evcpa.models import AnalysisResult, FieldItem
+from evcpa.multi_order import (
+    build_multi_order_choice,
+    combine_filter,
+    order_matches_filter,
+)
 
 # 心跳等链路帧：计入帧数，不参与订单字段汇总
 _LINK_FRAMES = {"0x03", "0x04", "0x0C", "0x8C", "0x0005"}
@@ -49,6 +54,40 @@ _BILL_FRAMES = {"0x3D", "0x3B", "0x08", "0x4006"}
 _START_FRAMES = {"0x34", "0x31", "0x33", "0x06", "0x86", "0x04", "0x84", "0x4000", "0x4001"}
 _STOP_FRAMES = {"0x36", "0x35", "0x19", "0x07", "0x87", "0x05", "0x85", "0x4002", "0x4003"}
 _REALTIME_FRAMES = {"0x13", "0x09", "0x2002", "0x4004"}
+
+
+def _order_duration_text(start: Any, end: Any) -> str:
+    """由起止时间估算充电时长。"""
+    if not start or not end or start == "-" or end == "-":
+        return "-"
+    from datetime import datetime
+    import re
+
+    def _parse(v: Any) -> datetime | None:
+        s = str(v).strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+            try:
+                return datetime.strptime(s[:19], fmt)
+            except ValueError:
+                continue
+        m = re.match(r"(\d{4})年(\d{1,2})月(\d{1,2})日\s+(\d{2}:\d{2}:\d{2})", s)
+        if m:
+            try:
+                return datetime.strptime(
+                    f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d} {m.group(4)}",
+                    "%Y-%m-%d %H:%M:%S",
+                )
+            except ValueError:
+                return None
+        return None
+
+    a, b = _parse(start), _parse(end)
+    if not a or not b:
+        return "-"
+    sec = int((b - a).total_seconds())
+    if sec < 0:
+        return "-"
+    return f"约 {round(sec / 60)} 分钟（{sec} 秒）"
 
 
 def _field_map(result: AnalysisResult) -> dict[str, FieldItem]:
@@ -221,9 +260,15 @@ def aggregate_frame_order(
     results: list[AnalysisResult],
     *,
     meta: dict[str, Any] | None = None,
+    service_id: str | None = None,
+    trade_no: str | None = None,
 ) -> dict[str, Any]:
-    """多帧解析结果 → charging_report；多流水号时按订单分组汇总。"""
+    """多帧解析结果 → charging_report；多流水号时按订单分组汇总。
+
+    未指定 service_id/trade_no 且识别到多笔订单时，返回 multi_order_choice 提示用户筛选。
+    """
     meta = meta or {}
+    filter_id = combine_filter(service_id, trade_no)
     protocol = results[0].protocol.value if results else "unknown"
     protocol_name = results[0].protocol_name if results else "未知"
 
@@ -289,6 +334,80 @@ def aggregate_frame_order(
         )
     )
 
+    pile = meta.get("pile") or next((o.get("pile") for o in orders if o.get("pile")), None)
+
+    # 多订单且未指定筛选：先展示服务ID/流水号，提示用户选择后再解析
+    if len(orders) > 1 and not filter_id:
+        choice_orders = [
+            {
+                "trade_no": o.get("trade_no"),
+                "service_id": o.get("service_id"),
+                "gun": o.get("gun"),
+                "energy": o.get("bill_energy"),
+                "money": o.get("bill_money"),
+                "start_way": o.get("start_way"),
+                "stop_reason": o.get("stop_reason"),
+            }
+            for o in orders
+        ]
+        return build_multi_order_choice(
+            choice_orders,
+            protocol=protocol,
+            protocol_name=protocol_name,
+            pile=pile,
+        )
+
+    if filter_id:
+        filtered = [o for o in orders if order_matches_filter(o, filter_id)]
+        if not filtered:
+            return {
+                "mode": "charging_report",
+                "protocol": protocol,
+                "protocol_name": protocol_name,
+                "confidence": 0.2,
+                "valid": False,
+                "summary": f"未找到服务ID/流水号 = {filter_id} 的订单，请确认填写是否正确。",
+                "conclusion": f"未找到服务ID/流水号 = {filter_id} 的充电订单。",
+                "verdict": "综合判断：筛选条件下无匹配订单，请核对服务ID或流水号。",
+                "result_points": [
+                    f"1. 已按服务ID/流水号「{filter_id}」筛选多帧报文。",
+                    f"2. 共识别到 {len(orders)} 笔订单，但无一匹配该筛选条件。",
+                    "3. 请核对输入，或留空后查看全部订单列表。",
+                ],
+                "report_text": (
+                    "充电订单分析报告（协议抓包/多帧）\n\n"
+                    f"筛选条件：服务ID/流水号 = {filter_id}\n\n"
+                    "未找到匹配订单。"
+                ),
+                "fields": [
+                    {"name": "筛选条件", "value": filter_id},
+                    {"name": "报文内订单笔数", "value": str(len(orders))},
+                    {"name": "匹配结果", "value": "无"},
+                ],
+                "warnings": [
+                    {
+                        "code": "SERVICE_NOT_FOUND",
+                        "level": "warn",
+                        "message": f"未找到服务ID/流水号 {filter_id}",
+                    }
+                ],
+                "extras": {
+                    "filtered": True,
+                    "filter_id": filter_id,
+                    "order_count": 0,
+                    "orders": [
+                        {
+                            "trade_no": o.get("trade_no"),
+                            "gun": o.get("gun"),
+                            "energy": o.get("bill_energy"),
+                            "money": o.get("bill_money"),
+                        }
+                        for o in orders
+                    ],
+                },
+            }
+        orders = filtered
+
     warnings: list[dict[str, Any]] = []
     for r in results:
         for w in r.warnings:
@@ -335,6 +454,12 @@ def aggregate_frame_order(
         {"name": "充电桩编号", "value": primary.get("pile") or meta.get("pile") or "-"},
         {"name": "枪口号", "value": f"{primary['gun']} 枪" if primary.get("gun") is not None else "-"},
         {"name": "订单流水号", "value": primary.get("trade_no") or "-"},
+        {"name": "启动时间", "value": primary.get("start_time") or "-"},
+        {"name": "结束时间", "value": primary.get("end_time") or "-"},
+        {
+            "name": "充电时长",
+            "value": _order_duration_text(primary.get("start_time"), primary.get("end_time")),
+        },
         {
             "name": "实际充电电量",
             "value": f"{primary['bill_energy']} kWh" if primary.get("bill_energy") is not None else "-",
@@ -459,6 +584,8 @@ def aggregate_frame_order(
             "frame_count": len(results),
             "link_frame_count": link_count,
             "order_count": len(orders),
+            "filtered": bool(filter_id),
+            "filter_id": filter_id,
             "orders": [
                 {
                     "trade_no": o["trade_no"],

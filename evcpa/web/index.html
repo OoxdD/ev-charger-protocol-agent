@@ -41,9 +41,14 @@
           </select>
         </label>
 
+        <label class="field">
+          <span>服务ID / 流水号（可选）</span>
+          <input type="text" id="orderFilter" placeholder="填写 service_Id 或 tradeNo，多枪/多订单时用于筛选" autocomplete="off" />
+        </label>
+
         <label class="field grow">
           <span>报文内容</span>
-          <textarea id="payload" spellcheck="false" placeholder="可直接导入平台订单日志（含 socInfo / chargingInfo / recordInfo），自动生成充电业务报告&#10;&#10;也可粘贴单条十六进制或 JSON 报文做协议解析"></textarea>
+          <textarea id="payload" spellcheck="false" placeholder="可直接导入平台订单日志（含 socInfo / chargingInfo / recordInfo），自动生成充电业务报告&#10;&#10;也可粘贴单条十六进制或 JSON 报文做协议解析&#10;&#10;多枪同时充电时，请填写服务ID或流水号后再分析"></textarea>
         </label>
 
         <div class="actions">
@@ -106,6 +111,6 @@
       <span>本地分析服务 · 数据不上传第三方</span>
     </footer>
   </div>
-  <script src="/static/app.js?v=20260723-protocol-log"></script>
+  <script src="/static/app.js?v=20260724-no-time-cards"></script>
 </body>
 </html>

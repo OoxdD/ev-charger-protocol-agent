@@ -3,6 +3,7 @@
 
   const protocolSel = $("protocol");
   const payload = $("payload");
+  const orderFilterInput = $("orderFilter");
   const fileInput = $("file");
   const fileHint = $("fileHint");
   const protocolCount = $("protocolCount");
@@ -29,6 +30,7 @@
 
   function hasAbnormalResult(data) {
     if (!data) return false;
+    if (data.mode === "multi_order_choice") return false;
     if (data.valid === false) return true;
     const warnings = data.warnings || [];
     if (warnings.some((w) => w.level === "error" || w.level === "warn")) return true;
@@ -178,18 +180,26 @@
     const text = payload.value.trim();
     if (!text) throw new Error("请先输入或导入报文内容");
 
+    const orderFilter = (orderFilterInput && orderFilterInput.value.trim()) || null;
+    const filters = {};
+    // 合并栏：同一值同时作为服务ID/流水号筛选条件（后端按二者匹配）
+    if (orderFilter) {
+      filters.service_id = orderFilter;
+      filters.trade_no = orderFilter;
+    }
+
     // 平台订单日志：整份文本交给后端抽取充电业务数据
     if (looksLikeOrderLog(text)) {
-      return { text };
+      return { text, ...filters };
     }
     // 协议抓包日志：按行提取【上报/下发】帧，避免时间戳污染 hex
     if (looksLikeProtocolTraceLog(text)) {
-      return { text, protocol: protocolSel.value || null };
+      return { text, protocol: protocolSel.value || null, ...filters };
     }
 
     const forced = protocolSel.value || null;
     const kind = inputMode === "auto" ? detectPayloadKind(text) : inputMode;
-    const body = { protocol: forced };
+    const body = { protocol: forced, ...filters };
 
     if (kind === "json") {
       try {
@@ -225,21 +235,30 @@
     resultView.hidden = false;
     copyBtn.hidden = false;
 
+    const isChoice = data.mode === "multi_order_choice";
     const isCharge = data.mode === "charging_report";
     const isMulti = data.mode === "multi_frame" || (data.extras && data.extras.frame_count > 1);
 
-    if (isCharge || data.mode === "multi_frame") {
+    if (isChoice || isCharge || data.mode === "multi_frame") {
       const points = data.result_points || [];
       resultPoints.textContent = points.length
         ? points.join("\n")
         : data.summary || data.conclusion || "已生成分析结果";
-      verdictText.textContent = withDeviceFollowup(data.verdict || "", data);
+      verdictText.textContent = isChoice
+        ? data.verdict || "该报文有多个订单，请选择并输入服务ID再进行解析"
+        : withDeviceFollowup(data.verdict || "", data);
 
       const pick = (name) => {
         const f = (data.fields || []).find((x) => x.name === name);
         return f ? f.value : "-";
       };
-      if (isCharge) {
+      if (isChoice) {
+        summaryGrid.innerHTML = [
+          card("订单笔数", pick("订单笔数")),
+          card("充电桩", pick("充电桩编号")),
+          card("状态", "需选择订单", "bad"),
+        ].join("");
+      } else if (isCharge) {
         summaryGrid.innerHTML = [
           card("充电桩", pick("充电桩编号")),
           card("枪口", pick("枪口号")),
@@ -266,21 +285,50 @@
         )
         .join("") || `<tr><td colspan="2">无信息</td></tr>`;
 
-      // 多帧明细追加到字段表下方（告警区之上用 cand 区域展示帧列表）
-      const frames = (data.extras && data.extras.frames) || [];
-      if (frames.length) {
+      const orders = (data.extras && data.extras.orders) || [];
+      if (isChoice && orders.length) {
         candBlock.hidden = false;
-        if (candTitle) candTitle.textContent = "帧明细";
-        candList.innerHTML = frames
-          .slice(0, 40)
-          .map((fr, i) => {
-            const title = escapeHtml(fr.frame_type_name || fr.frame_type || `帧${i + 1}`);
-            const ok = fr.valid !== false ? "ok" : "bad";
-            return `<div class="cand ${ok}">${i + 1}. ${title}<strong>${fr.valid !== false ? "有效" : "异常"}</strong></div>`;
+        if (candTitle) candTitle.textContent = "点击选择订单（自动填入并重新分析）";
+        candList.innerHTML = `<div class="order-pick-list">${orders
+          .map((o, i) => {
+            const sid = o.service_id || "-";
+            const tn = o.trade_no || "-";
+            const gun = o.gun != null ? `${o.gun} 枪` : "-";
+            const energy = o.energy != null ? `${o.energy} kWh` : "-";
+            const money = o.money != null ? `${o.money} 元` : "-";
+            return `<button type="button" class="order-pick" data-service-id="${escapeHtml(
+              o.service_id || ""
+            )}" data-trade-no="${escapeHtml(o.trade_no || "")}">
+              <strong>订单 ${o.index || i + 1}</strong>
+              <span>服务ID：${escapeHtml(sid)}　流水号：${escapeHtml(tn)}</span>
+              <span>枪口：${escapeHtml(gun)}　电量：${escapeHtml(energy)}　费用：${escapeHtml(money)}</span>
+            </button>`;
           })
-          .join("");
+          .join("")}</div>`;
+        candList.querySelectorAll(".order-pick").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const sid = btn.getAttribute("data-service-id") || "";
+            const tn = btn.getAttribute("data-trade-no") || "";
+            if (orderFilterInput) orderFilterInput.value = sid || tn;
+            analyze();
+          });
+        });
       } else {
-        candBlock.hidden = true;
+        const frames = (data.extras && data.extras.frames) || [];
+        if (frames.length) {
+          candBlock.hidden = false;
+          if (candTitle) candTitle.textContent = "帧明细";
+          candList.innerHTML = frames
+            .slice(0, 40)
+            .map((fr, i) => {
+              const title = escapeHtml(fr.frame_type_name || fr.frame_type || `帧${i + 1}`);
+              const ok = fr.valid !== false ? "ok" : "bad";
+              return `<div class="cand ${ok}">${i + 1}. ${title}<strong>${fr.valid !== false ? "有效" : "异常"}</strong></div>`;
+            })
+            .join("");
+        } else {
+          candBlock.hidden = true;
+        }
       }
 
       const chargeWarnings = data.warnings || [];
@@ -288,7 +336,7 @@
       const warnItems = chargeWarnings.map(
         (w) => `<li>[${escapeHtml(w.level || "info")}] ${escapeHtml(w.message || w.code || "")}</li>`
       );
-      if (hasAbnormalResult(data)) {
+      if (!isChoice && hasAbnormalResult(data)) {
         warnItems.push(`<li class="followup">${escapeHtml(DEVICE_FOLLOWUP)}</li>`);
       }
       warnList.innerHTML = warnItems.join("");
@@ -412,6 +460,7 @@
 
   clearBtn.addEventListener("click", () => {
     payload.value = "";
+    if (orderFilterInput) orderFilterInput.value = "";
     fileInput.value = "";
     fileHint.textContent = "";
     showEmpty();
@@ -425,7 +474,7 @@
   });
 
   function buildShareText(data) {
-    if (data.mode === "charging_report") {
+    if (data.mode === "multi_order_choice" || data.mode === "charging_report") {
       return data.report_text || buildChargingShareText(data);
     }
 

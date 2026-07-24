@@ -252,8 +252,8 @@ class WeijingParser(ProtocolParser):
             return self._parse_remote_stop(body, base)
         if cmd == 0x87:
             return self._parse_remote_start_ack(body, base)  # 同结构：订单+结果
-        if cmd == 0x09:
-            return self._parse_progress(body, base)
+        if cmd in (0x08, 0x09):
+            return self._parse_bill_or_progress(body, base)
         if cmd in WEIJING_CMDS:
             return [
                 FieldItem(
@@ -512,7 +512,11 @@ class WeijingParser(ProtocolParser):
             )
         return items
 
-    def _parse_progress(self, body: bytes, base: int) -> list[FieldItem]:
+    def _parse_bill_or_progress(self, body: bytes, base: int) -> list[FieldItem]:
+        """0x08 上传充电账单 / 0x09 上传充电进度。
+
+        电量、金额及后续 DWORD 数值按协议万分位换算：15650 → 1.565。
+        """
         items: list[FieldItem] = []
         o = 0
         if self._need(body, o, 1):
@@ -579,9 +583,19 @@ class WeijingParser(ProtocolParser):
         if not self._need(body, o, 1):
             return items
         precision = body[o]
-        items.append(FieldItem(name="precision", value=precision, offset=base + o, length=1, meaning="数据精度位"))
+        items.append(
+            FieldItem(
+                name="precision",
+                value=precision,
+                offset=base + o,
+                length=1,
+                meaning="数据精度位（解析按万分位 ÷10000）",
+            )
+        )
         o += 1
-        scale = 10**precision if 0 <= precision <= 6 else 100.0
+        # 蔚景 0x08/0x09：数值固定万分位，例 15650 → 1.565
+        scale = 10000.0
+        decimals = 4
 
         def scaled(name: str, unit: str, meaning: str) -> None:
             nonlocal o
@@ -591,7 +605,7 @@ class WeijingParser(ProtocolParser):
             items.append(
                 FieldItem(
                     name=name,
-                    value=round(raw_v / scale, precision if precision <= 6 else 2),
+                    value=round(raw_v / scale, decimals),
                     offset=base + o,
                     length=4,
                     unit=unit,
@@ -618,3 +632,6 @@ class WeijingParser(ProtocolParser):
         scaled("need_voltage", "V", "电压需求")
         scaled("need_current", "A", "电流需求")
         return items
+
+    def _parse_progress(self, body: bytes, base: int) -> list[FieldItem]:
+        return self._parse_bill_or_progress(body, base)

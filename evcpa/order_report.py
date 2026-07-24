@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from datetime import date
+from datetime import date, datetime
 from statistics import mean
 from typing import Any
 
@@ -16,7 +16,8 @@ _SOC_INFO = re.compile(r"--socInfo:(\{.*\})")
 _CHARGING_INFO = re.compile(r"--chargingInfo:(\{.*\})")
 _RECORD_INFO = re.compile(r"--recordInfo:(\{.*\})")
 _BILL_CMD8 = re.compile(r"上报账单\[cmd=0x8\]:(\{.*\})")
-_GUN_STATUS = re.compile(r"(\d+)枪:([A-Z_]+)")
+_BILL_ANY = re.compile(r"上报账单\[cmd=0x[0-9A-Fa-f]+\]:(\{.*\})")
+_GUN_STATUS = re.compile(r"(\d+)枪[:：]([A-Z_]+)")
 _TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)")
 _SEP = "=" * 80
 
@@ -29,8 +30,17 @@ _CARD_START_MARKERS = (
 _VIN_START_MARKERS = (
     "VIN验证启动",
     "VIN鉴权",
+    "VIN充电",
+    "创建VIN码充电服务信息",
+    "创建VIN充电服务信息",
     "createCardChargeServiceInfo（VIN",
     "createCardChargeServiceInfo(VIN",
+)
+
+# 仅应答文案，不能当作平台下发了远程停止命令
+_REMOTE_STOP_ACK_ONLY = (
+    "远程停止充电应答",
+    "远程停止应答",
 )
 
 
@@ -115,8 +125,12 @@ def _infer_start_way(
 
     if card_no.upper().startswith("VIN") and _has_real_vin(card_no[3:] or vin):
         return "VIN鉴权启动（成功）"
-    # 平台结算字段：startWay=5 常见为 VIN；云快充 0x31：1=刷卡、3=VIN
-    if sw == "5" and (_has_real_vin(vin) or card_no.upper().startswith("VIN")):
+    # 卡号本身就是 VIN（万马 VIN 启动常见）
+    if _has_real_vin(card_no) and (card_no == str(vin or "").strip() or not physical):
+        if any(m in text for m in ("VIN", "创建VIN")) or sw in {"4", "5", "3"}:
+            return "VIN鉴权启动（成功）"
+    # 平台结算字段：startWay=5 常见为 VIN；万马 startWay=4=VIN；云快充 0x31：1=刷卡、3=VIN
+    if sw in {"4", "5"} and (_has_real_vin(vin) or _has_real_vin(card_no) or card_no.upper().startswith("VIN")):
         return "VIN鉴权启动（成功）"
     if sw == "3" and not remote:
         return "VIN鉴权启动（成功）"
@@ -127,9 +141,14 @@ def _infer_start_way(
     if physical and not remote and "远程启动充电" not in text:
         return "刷卡启动（成功）"
 
-    if remote or start_ok or "远程启动充电" in text:
+    # 「远程启动充电应答」常见于 VIN/刷卡桩内启机后的平台应答，不能单凭该文案判远程启动
+    has_remote_start_cmd = bool(remote) and _remote_cmd_str(remote) in _REMOTE_START_CMDS
+    has_remote_start_phrase = "远程启动充电," in text or "下发远程启动" in text
+    if has_remote_start_cmd or start_ok or has_remote_start_phrase:
         return "远程启动（成功）"
-    if "RemoteCmd" in text or sw == "2":
+    if "RemoteCmd" in text and _remote_cmd_str(remote) in _REMOTE_START_CMDS:
+        return "远程启动（成功）"
+    if sw == "2":
         return "远程启动（成功）"
     return "未知"
 
@@ -151,21 +170,45 @@ def _num(v: Any, div: float = 1.0, digits: int = 3) -> float | None:
         return None
 
 
+def _accuracy_scale(obj: dict[str, Any] | None, default: int = 1000) -> int:
+    """从 accuracyFlag 得到除数：4→10000（万分位），缺省千分位 1000。"""
+    if not isinstance(obj, dict):
+        return default
+    flag = obj.get("accuracyFlag")
+    if flag is None:
+        flag = obj.get("accuracy")
+    try:
+        f = int(flag)
+    except (TypeError, ValueError):
+        return default
+    if 0 <= f <= 6:
+        return 10**f
+    return default
+
+
+def _to_real(v: Any, scale: int, digits: int = 4) -> float | None:
+    """原始整型 → 实际物理量（kWh/元等）。"""
+    return _num(v, float(scale), digits)
+
+
 def _fmt_money(v: Any, scale: int = 1000) -> str:
-    n = _num(v, scale, 3)
+    digits = 4 if scale >= 10000 else 3
+    n = _num(v, scale, digits)
     if n is None:
         return "-"
-    text = f"{n:.3f}".rstrip("0").rstrip(".")
+    text = f"{n:.{digits}f}".rstrip("0").rstrip(".")
     return f"{text} 元"
 
 
-def _fmt_kwh(v: Any) -> str:
-    n = _num(v, 1000, 3)
+def _fmt_kwh(v: Any, scale: int = 1000) -> str:
+    digits = 4 if scale >= 10000 else 3
+    n = _num(v, scale, digits)
     if n is None:
         return "-"
     if abs(n) < 1e-9:
         return "0 kwh"
-    return f"{n:.3f} kwh"
+    text = f"{n:.{digits}f}".rstrip("0").rstrip(".")
+    return f"{text} kwh"
 
 
 def _fmt_amp(v: Any) -> str:
@@ -188,11 +231,12 @@ def _fmt_temp(v: Any) -> str:
     return "-" if n is None else f"{n:.1f}℃"
 
 
-def _fmt_price(v: Any) -> str:
-    n = _num(v, 1000, 3)
+def _fmt_price(v: Any, scale: int = 1000) -> str:
+    digits = 4 if scale >= 10000 else 3
+    n = _num(v, scale, digits)
     if n is None:
         return "-"
-    text = f"{n:.3f}".rstrip("0").rstrip(".")
+    text = f"{n:.{digits}f}".rstrip("0").rstrip(".")
     return f"{text} 元/kwh"
 
 
@@ -205,6 +249,266 @@ def _cn_datetime(s: str) -> str:
         return s
     y, mo, d, t = m.groups()
     return f"{int(y)}年{int(mo)}月{int(d)}日 {t}"
+
+
+def _parse_log_time(v: Any) -> str | None:
+    """解析账单/结算中的时间：BCD(yyMMddHHmmss) / unix 秒 / ISO 字符串。"""
+    if v is None or v == "" or v == "-":
+        return None
+    # 已是标准串
+    if isinstance(v, str):
+        s = v.strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}", s):
+            return s[:19].replace("T", " ")
+        # 14 位：yyyyMMddHHmmss
+        if re.fullmatch(r"\d{14}", s):
+            return f"{s[0:4]}-{s[4:6]}-{s[6:8]} {s[8:10]}:{s[10:12]}:{s[12:14]}"
+        # 12 位：yyMMddHHmmss（蔚景账单常见）
+        if re.fullmatch(r"\d{12}", s):
+            return f"20{s[0:2]}-{s[2:4]}-{s[4:6]} {s[6:8]}:{s[8:10]}:{s[10:12]}"
+        # 纯数字 unix
+        if re.fullmatch(r"\d{9,12}", s):
+            try:
+                v = int(s)
+            except ValueError:
+                return None
+        else:
+            return None
+    if isinstance(v, (int, float)):
+        n = int(v)
+        # 12 位 BCD 整数：260722115634
+        if 10**11 <= n < 10**12:
+            s = f"{n:012d}"
+            return f"20{s[0:2]}-{s[2:4]}-{s[4:6]} {s[6:8]}:{s[8:10]}:{s[10:12]}"
+        # 14 位
+        if 10**13 <= n < 10**14:
+            s = f"{n:014d}"
+            return f"{s[0:4]}-{s[4:6]}-{s[6:8]} {s[8:10]}:{s[10:12]}:{s[12:14]}"
+        # unix 秒（约 2001–2099）
+        if 1_000_000_000 <= n <= 4_102_444_800:
+            try:
+                return datetime.fromtimestamp(n).strftime("%Y-%m-%d %H:%M:%S")
+            except (OverflowError, OSError, ValueError):
+                return None
+        # 毫秒时间戳
+        if 1_000_000_000_000 <= n <= 4_102_444_800_000:
+            try:
+                return datetime.fromtimestamp(n / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+            except (OverflowError, OSError, ValueError):
+                return None
+    return None
+
+
+def _duration_seconds(start_iso: str | None, end_iso: str | None) -> int | None:
+    if not start_iso or not end_iso or start_iso == "-" or end_iso == "-":
+        return None
+    try:
+        a = datetime.strptime(start_iso[:19], "%Y-%m-%d %H:%M:%S")
+        b = datetime.strptime(end_iso[:19], "%Y-%m-%d %H:%M:%S")
+        sec = int((b - a).total_seconds())
+        return sec if sec >= 0 else None
+    except ValueError:
+        return None
+
+
+def _fmt_duration(seconds: Any) -> str:
+    if seconds is None or seconds == "" or seconds == "-":
+        return "-"
+    try:
+        sec = int(float(seconds))
+    except (TypeError, ValueError):
+        return "-"
+    if sec < 0:
+        return "-"
+    return f"约 {round(sec / 60)} 分钟（{sec} 秒）"
+
+
+# 平台远程停止命令（常见 remoteCmd=18）
+_REMOTE_STOP_CMDS = {"18", "16", "19"}
+_REMOTE_START_CMDS = {"17", "1", "03", "3", "14"}
+
+
+def _remote_cmd_str(obj: dict[str, Any] | None) -> str:
+    if not isinstance(obj, dict):
+        return ""
+    return str(obj.get("remoteCmd") or "").strip()
+
+
+def _extract_stop_reason_msg(obj: dict[str, Any] | None) -> str | None:
+    if not isinstance(obj, dict):
+        return None
+    data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+    for key in ("stopReasonMsg", "stopReason", "remoteStopReason", "stopMsg"):
+        v = obj.get(key)
+        if v is None:
+            v = data.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+def _gun_status_sequence(
+    gun_events: list[tuple[str, str, str]],
+    gun: str,
+) -> list[tuple[str, str]]:
+    """提取本枪口状态序列 [(ts, status), ...]。"""
+    seq: list[tuple[str, str]] = []
+    for ts, g, st in gun_events:
+        if gun and gun != "-" and str(g) != str(gun):
+            continue
+        if not seq or seq[-1][1] != st:
+            seq.append((ts, st))
+    return seq
+
+
+def _analyze_stop(
+    *,
+    has_remote_stop: bool,
+    remote_stop_msg: str | None,
+    finish_msg: str | None,
+    finish_code: Any,
+    gun_events: list[tuple[str, str, str]],
+    gun: str,
+) -> dict[str, Any]:
+    """区分平台远程停止 / 设备跳枪 / 直接拔枪 / 枪口故障 / 疑似急停。"""
+    finish = (finish_msg or "").strip() if finish_msg and finish_msg != "-" else ""
+    platform_msg = (remote_stop_msg or "").strip() if remote_stop_msg else ""
+    seq = _gun_status_sequence(gun_events, gun)
+
+    # 充电后的状态变迁
+    after_charge: list[tuple[str, str]] = []
+    seen_charging = False
+    for ts, st in seq:
+        if st == "CHARGING":
+            seen_charging = True
+            after_charge = []
+            continue
+        if seen_charging:
+            after_charge.append((ts, st))
+
+    trouble_idxs = [i for i, (_, st) in enumerate(seq) if st == "TROUBLE"]
+    brief_trouble = False
+    persistent_trouble = False
+    if trouble_idxs:
+        # 故障后是否恢复正常
+        last_t = trouble_idxs[-1]
+        recovered = any(
+            seq[i][1] in {"READY_CHARGE", "IDLE", "CHARGING", "OCCUPYING", "FINISH"}
+            for i in range(last_t + 1, len(seq))
+        )
+        # 故障出现次数少且很快恢复 → 疑似急停
+        if recovered and len(trouble_idxs) <= 3:
+            brief_trouble = True
+        elif not recovered or len(trouble_idxs) >= 5:
+            persistent_trouble = True
+        else:
+            brief_trouble = recovered
+
+    first_after = after_charge[0][1] if after_charge else None
+
+    if has_remote_stop:
+        reason = platform_msg or finish or "平台远程停止"
+        return {
+            "category": "remote_stop",
+            "stop_type": "平台远程停止",
+            "reason": reason,
+            "platform_stop_reason": platform_msg or "-",
+            "device_finish_reason": finish or "-",
+            "gun_transition": first_after or "-",
+            "tip": "",
+            "evidence": "日志中存在平台远程停止指令"
+            + (f"；平台原因：{platform_msg}" if platform_msg else ""),
+        }
+
+    # 无远程停止 → 设备侧结束
+    if persistent_trouble or (first_after == "TROUBLE" and not brief_trouble):
+        return {
+            "category": "gun_fault",
+            "stop_type": "枪口故障停止",
+            "reason": finish or "枪口故障（TROUBLE）",
+            "platform_stop_reason": "-",
+            "device_finish_reason": finish or "-",
+            "gun_transition": "TROUBLE",
+            "tip": "枪口状态变为 TROUBLE 并持续上报，请结合设备故障码排查。",
+            "evidence": "枪口状态出现 TROUBLE 且未快速恢复"
+            + (f"；设备上报：{finish}" if finish else ""),
+        }
+
+    if brief_trouble:
+        return {
+            "category": "estop_suspect",
+            "stop_type": "疑似急停停止",
+            "reason": finish or "疑似用户按下急停按钮",
+            "platform_stop_reason": "-",
+            "device_finish_reason": finish or "-",
+            "gun_transition": "TROUBLE→恢复",
+            "tip": "枪口曾短暂进入 TROUBLE 后恢复正常，大概率为用户按下急停按钮，请向现场用户确认。",
+            "evidence": "故障状态短暂出现后恢复"
+            + (f"；设备上报：{finish}" if finish else ""),
+        }
+
+    if first_after == "IDLE" or any(st == "IDLE" for _, st in after_charge[:3]):
+        return {
+            "category": "device_idle_unplug",
+            "stop_type": "设备跳枪停止（直接拔枪）",
+            "reason": finish or "充电过程中直接拔枪（枪口变为 IDLE）",
+            "platform_stop_reason": "-",
+            "device_finish_reason": finish or "-",
+            "gun_transition": "CHARGING→IDLE",
+            "tip": "",
+            "evidence": "充电中枪口变为 IDLE，通常为未回枪座直接拔枪"
+            + (f"；设备上报：{finish}" if finish else ""),
+        }
+
+    if first_after == "OCCUPYING" or any(st == "OCCUPYING" for _, st in after_charge[:3]):
+        return {
+            "category": "device_occupy",
+            "stop_type": "设备跳枪停止（占桩）",
+            "reason": finish or "跳枪后进入占桩（OCCUPYING）",
+            "platform_stop_reason": "-",
+            "device_finish_reason": finish or "-",
+            "gun_transition": "CHARGING→OCCUPYING",
+            "tip": "",
+            "evidence": "充电结束后枪口变为 OCCUPYING"
+            + (f"；设备上报：{finish}" if finish else ""),
+        }
+
+    if first_after == "READY_CHARGE" or any(st == "READY_CHARGE" for _, st in after_charge[:3]):
+        return {
+            "category": "device_unplug",
+            "stop_type": "设备跳枪停止",
+            "reason": finish or "设备跳枪（CHARGING→READY_CHARGE）",
+            "platform_stop_reason": "-",
+            "device_finish_reason": finish or "-",
+            "gun_transition": "CHARGING→READY_CHARGE",
+            "tip": "",
+            "evidence": "枪口由充电变为待充 READY_CHARGE"
+            + (f"；设备上报：{finish}" if finish else ""),
+        }
+
+    # 无枪状态变迁时，仍优先展示设备账单原因
+    if finish:
+        return {
+            "category": "device_finish",
+            "stop_type": "设备主动结束",
+            "reason": finish,
+            "platform_stop_reason": "-",
+            "device_finish_reason": finish,
+            "gun_transition": first_after or "-",
+            "tip": "",
+            "evidence": f"无平台远程停止指令；设备上报结束原因：{finish}",
+        }
+
+    return {
+        "category": "unknown",
+        "stop_type": "停止原因待确认",
+        "reason": "-",
+        "platform_stop_reason": "-",
+        "device_finish_reason": "-",
+        "gun_transition": first_after or "-",
+        "tip": "日志中未识别到远程停止或明确枪口跳变，请结合现场确认。",
+        "evidence": "缺少平台远程停止指令与可用的枪口状态变迁",
+    }
 
 
 def _section(title: str) -> list[str]:
@@ -249,6 +553,164 @@ def _match_service(obj: dict[str, Any] | None, service_id: str | None) -> bool:
         return True
     ns = _norm_id(sid)
     return bool(ns) and ns in {_norm_id(x) for x in ids}
+
+
+def _order_key_of(obj: dict[str, Any] | None) -> tuple[str, str]:
+    """返回 (service_id, trade_no)，优先用于多订单分组。"""
+    if not isinstance(obj, dict):
+        return ("", "")
+    data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+    sid = ""
+    for key in ("serviceId", "service_id", "serviceChargeId"):
+        v = obj.get(key) or data.get(key)
+        if v is not None and str(v).strip() and not re.fullmatch(r"0+", str(v).strip()):
+            sid = str(v).strip()
+            break
+    tn = ""
+    for key in ("tradeNo", "orderId", "txnId"):
+        v = obj.get(key) or data.get(key)
+        if v is not None and str(v).strip() and not re.fullmatch(r"0+", str(v).strip()):
+            tn = str(v).strip()
+            break
+    return (sid, tn)
+
+
+def _discover_orders(text: str) -> list[dict[str, Any]]:
+    """从平台日志扫描出多笔订单的服务ID/流水号（用于多枪提示）。"""
+    items: list[dict[str, Any]] = []
+
+    def _push(obj: dict[str, Any] | None) -> None:
+        if not isinstance(obj, dict):
+            return
+        sid, tn = _order_key_of(obj)
+        if not sid and not tn:
+            return
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+        gun = obj.get("interfaceCode")
+        if gun is None:
+            gun = data.get("interfaceCode")
+        try:
+            gun_v = int(gun) if gun is not None else None
+        except (TypeError, ValueError):
+            gun_v = gun
+        energy = None
+        money = None
+        for ek, mk in (
+            ("totalElect", "totalMoney"),
+            ("chargedPower", "chargedAmount"),
+            ("totalBattery", "chargeMoney"),
+            ("battery", "money"),
+        ):
+            ev = obj.get(ek)
+            if ev is None:
+                ev = data.get(ek)
+            mv = obj.get(mk)
+            if mv is None:
+                mv = data.get(mk)
+            try:
+                if energy is None and ev is not None and float(ev) > 0:
+                    # totalBattery 等常见为 0.001 kWh
+                    fv = float(ev)
+                    energy = fv / 1000.0 if fv >= 100 else fv
+            except (TypeError, ValueError):
+                pass
+            try:
+                if money is None and mv is not None and float(mv) > 0:
+                    fv = float(mv)
+                    money = fv / 1000.0 if fv > 1000 else fv
+            except (TypeError, ValueError):
+                pass
+        pile = obj.get("deviceNo") or data.get("deviceNo")
+        items.append(
+            {
+                "service_id": sid or None,
+                "trade_no": tn or None,
+                "gun": gun_v,
+                "pile": str(pile) if pile else None,
+                "energy": energy,
+                "money": money,
+            }
+        )
+
+    for ln in text.splitlines():
+        for rx in (_REMOTE_CMD, _REMOTE_START, _SOC_INFO, _CHARGING_INFO, _RECORD_INFO, _BILL_CMD8):
+            m = rx.search(ln)
+            if m:
+                _push(_load_json(m.group(1)))
+
+    if not items:
+        return []
+
+    # 并查集合并：共享 serviceId 或 tradeNo 的视为同一订单
+    parent = list(range(len(items)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    sid_index: dict[str, int] = {}
+    tn_index: dict[str, int] = {}
+    for i, it in enumerate(items):
+        sid_n = _norm_id(it.get("service_id"))
+        tn_n = _norm_id(it.get("trade_no"))
+        if sid_n:
+            if sid_n in sid_index:
+                union(i, sid_index[sid_n])
+            else:
+                sid_index[sid_n] = i
+        if tn_n:
+            if tn_n in tn_index:
+                union(i, tn_index[tn_n])
+            else:
+                tn_index[tn_n] = i
+        # 若同一条同时有 sid/tn，再交叉关联
+        if sid_n and tn_n and sid_n in sid_index and tn_n in tn_index:
+            union(sid_index[sid_n], tn_index[tn_n])
+
+    groups: dict[int, dict[str, Any]] = {}
+    for i, it in enumerate(items):
+        root = find(i)
+        slot = groups.setdefault(
+            root,
+            {
+                "service_id": None,
+                "trade_no": None,
+                "gun": None,
+                "pile": None,
+                "energy": None,
+                "money": None,
+                "start_way": None,
+                "stop_reason": None,
+            },
+        )
+        if it.get("service_id") and not slot["service_id"]:
+            slot["service_id"] = it["service_id"]
+        if it.get("trade_no") and not slot["trade_no"]:
+            slot["trade_no"] = it["trade_no"]
+        if it.get("gun") is not None and slot["gun"] is None:
+            slot["gun"] = it["gun"]
+        if it.get("pile") and not slot["pile"]:
+            slot["pile"] = it["pile"]
+        if it.get("energy") is not None:
+            slot["energy"] = it["energy"]
+        if it.get("money") is not None:
+            slot["money"] = it["money"]
+
+    orders = [o for o in groups.values() if o.get("service_id") or o.get("trade_no")]
+    orders.sort(
+        key=lambda o: (
+            str(o.get("service_id") or ""),
+            str(o.get("trade_no") or ""),
+        )
+    )
+    return orders
 
 
 def _pick_primary_trade_no(
@@ -321,13 +783,13 @@ def _dominant_tou(tou: dict[str, float]) -> str | None:
     return max(tou.items(), key=lambda kv: kv[1])[0]
 
 
-def _fmt_tou_brief(tou: dict[str, float]) -> str:
-    parts = [f"{k}{_fmt_kwh(v)}" for k, v in tou.items() if v and float(v) > 0]
+def _fmt_tou_brief(tou: dict[str, float], scale: int = 1000) -> str:
+    parts = [f"{k}{_fmt_kwh(v, scale)}" for k, v in tou.items() if v and float(v) > 0]
     return "、".join(parts) if parts else "无分时电量"
 
 
-# 过程与账单电量差 < 1 kwh（千分位 1000）视为可忽略
-_ENERGY_TOL_RAW = 1000.0
+# 过程与账单电量差 < 1 kWh 视为可忽略（比较前先按 accuracyFlag 换算）
+_ENERGY_TOL_KWH = 1.0
 
 
 def _check_process_vs_bill(
@@ -335,8 +797,13 @@ def _check_process_vs_bill(
     bill_src: dict[str, Any] | None,
     start_meter: Any,
     end_meter: Any,
+    *,
+    meter_scale: int | None = None,
 ) -> list[dict[str, Any]]:
-    """过程 chargingInfo 与账单/结算电量、分时交叉校验。"""
+    """过程 chargingInfo 与账单/结算电量、分时交叉校验。
+
+    各侧按自身 accuracyFlag 换算为 kWh 后再比较（蔚景账单常见 accuracyFlag=4 万分位）。
+    """
     checks: list[dict[str, Any]] = []
     if not proc and not bill_src:
         return [
@@ -347,26 +814,37 @@ def _check_process_vs_bill(
             }
         ]
 
-    proc_total = float((proc or {}).get("totalBattery") or 0) if proc else None
-    bill_total = float((bill_src or {}).get("totalBattery") or 0) if bill_src else None
+    proc_scale = _accuracy_scale(proc, 1000)
+    bill_scale = _accuracy_scale(bill_src, 1000)
+    m_scale = meter_scale if meter_scale is not None else bill_scale
+
+    proc_raw = float((proc or {}).get("totalBattery") or 0) if proc else None
+    bill_raw = float((bill_src or {}).get("totalBattery") or 0) if bill_src else None
+    proc_total = (proc_raw / proc_scale) if proc_raw is not None else None
+    bill_total = (bill_raw / bill_scale) if bill_raw is not None else None
     meter_delta = None
     try:
         if start_meter is not None and end_meter is not None:
-            meter_delta = float(end_meter) - float(start_meter)
+            meter_delta = (float(end_meter) - float(start_meter)) / float(m_scale)
     except (TypeError, ValueError):
         meter_delta = None
+
+    def _fk(v: float | None) -> str:
+        if v is None:
+            return "-"
+        return _fmt_kwh(v * 1000, 1000)  # 已是 kWh，借千分位格式化
 
     # 1) 总电量：过程 vs 账单
     if proc_total is not None and bill_total is not None and (proc_total > 0 or bill_total > 0):
         diff = abs(proc_total - bill_total)
-        if diff < _ENERGY_TOL_RAW:
+        if diff < _ENERGY_TOL_KWH:
             checks.append(
                 {
                     "ok": True,
                     "code": "TOTAL_OK",
                     "message": (
-                        f"总电量一致：过程 {_fmt_kwh(proc_total)}，账单 {_fmt_kwh(bill_total)}"
-                        + (f"（差值 {_fmt_kwh(diff)}，可忽略）" if diff > 0 else "")
+                        f"总电量一致：过程 {_fk(proc_total)}，账单 {_fk(bill_total)}"
+                        + (f"（差值 {_fk(diff)}，可忽略）" if diff > 0 else "")
                         + "。"
                     ),
                 }
@@ -377,8 +855,8 @@ def _check_process_vs_bill(
                     "ok": False,
                     "code": "TOTAL_MISMATCH",
                     "message": (
-                        f"总电量不一致：过程 {_fmt_kwh(proc_total)}，账单 {_fmt_kwh(bill_total)}，"
-                        f"相差 {_fmt_kwh(diff)}（超过 1 kwh 容差）。"
+                        f"总电量不一致：过程 {_fk(proc_total)}，账单 {_fk(bill_total)}，"
+                        f"相差 {_fk(diff)}（超过 1 kwh 容差）。"
                     ),
                 }
             )
@@ -386,15 +864,15 @@ def _check_process_vs_bill(
     # 2) 表计差额 vs 账单总电量
     if meter_delta is not None and bill_total is not None and bill_total > 0:
         diff = abs(meter_delta - bill_total)
-        if diff < _ENERGY_TOL_RAW:
+        if diff < _ENERGY_TOL_KWH:
             checks.append(
                 {
                     "ok": True,
                     "code": "METER_OK",
                     "message": (
-                        f"表计电量与账单一致：表计差额 {_fmt_kwh(meter_delta)}，"
-                        f"账单 {_fmt_kwh(bill_total)}"
-                        + (f"（差值 {_fmt_kwh(diff)}，可忽略）" if diff > 0 else "")
+                        f"表计电量与账单一致：表计差额 {_fk(meter_delta)}，"
+                        f"账单 {_fk(bill_total)}"
+                        + (f"（差值 {_fk(diff)}，可忽略）" if diff > 0 else "")
                         + "。"
                     ),
                 }
@@ -405,17 +883,25 @@ def _check_process_vs_bill(
                     "ok": False,
                     "code": "METER_MISMATCH",
                     "message": (
-                        f"表计电量与账单不一致：表计差额 {_fmt_kwh(meter_delta)}，"
-                        f"账单 {_fmt_kwh(bill_total)}，相差 {_fmt_kwh(diff)}。"
+                        f"表计电量与账单不一致：表计差额 {_fk(meter_delta)}，"
+                        f"账单 {_fk(bill_total)}，相差 {_fk(diff)}。"
                     ),
                 }
             )
 
-    # 3) 分时电量：过程 vs 账单（主导时段 + 各时段）
-    proc_tou = _tou_map(proc)
-    bill_tou = _tou_map(bill_src)
+    # 3) 分时电量：过程 vs 账单（主导时段 + 各时段）——先换算到 kWh
+    proc_tou_raw = _tou_map(proc)
+    bill_tou_raw = _tou_map(bill_src)
+    proc_tou = {k: float(v) / proc_scale for k, v in proc_tou_raw.items()}
+    bill_tou = {k: float(v) / bill_scale for k, v in bill_tou_raw.items()}
+    # dominant 用换算后的量
     proc_dom = _dominant_tou(proc_tou)
     bill_dom = _dominant_tou(bill_tou)
+
+    def _tou_brief_kwh(tou: dict[str, float]) -> str:
+        parts = [f"{k}{_fk(v)}" for k, v in tou.items() if v and float(v) > 0]
+        return "、".join(parts) if parts else "无分时电量"
+
     if proc_dom and bill_dom:
         if proc_dom == bill_dom:
             checks.append(
@@ -424,7 +910,7 @@ def _check_process_vs_bill(
                     "code": "TOU_DOM_OK",
                     "message": (
                         f"分时主导时段一致：过程与账单均为“{proc_dom}”"
-                        f"（过程 {_fmt_tou_brief(proc_tou)}；账单 {_fmt_tou_brief(bill_tou)}）。"
+                        f"（过程 {_tou_brief_kwh(proc_tou)}；账单 {_tou_brief_kwh(bill_tou)}）。"
                     ),
                 }
             )
@@ -434,56 +920,52 @@ def _check_process_vs_bill(
                     "ok": False,
                     "code": "TOU_DOM_MISMATCH",
                     "message": (
-                        f"分时主导时段不一致：过程为“{proc_dom}”（{_fmt_tou_brief(proc_tou)}），"
-                        f"账单为“{bill_dom}”（{_fmt_tou_brief(bill_tou)}）。"
+                        f"分时主导时段不一致：过程为“{proc_dom}”（{_tou_brief_kwh(proc_tou)}），"
+                        f"账单为“{bill_dom}”（{_tou_brief_kwh(bill_tou)}）。"
                     ),
                 }
             )
 
-        # 各时段逐项：仅当两侧该时段都有明显电量，或一侧有另一侧接近 0
         for name in ("尖", "峰", "平", "谷"):
             pv, bv = proc_tou[name], bill_tou[name]
-            if pv < _ENERGY_TOL_RAW and bv < _ENERGY_TOL_RAW:
+            if pv < _ENERGY_TOL_KWH and bv < _ENERGY_TOL_KWH:
                 continue
-            # 账单某时段被“归集放大”且远超账单总电量时，跳过该时段绝对值对比，避免误报
-            if bill_total and bv > float(bill_total) + _ENERGY_TOL_RAW and name == "平":
+            if bill_total and bv > float(bill_total) + _ENERGY_TOL_KWH and name == "平":
                 checks.append(
                     {
                         "ok": True,
                         "code": "TOU_BILL_AGG",
                         "message": (
-                            f"账单“{name}”段 {_fmt_kwh(bv)} 高于账单总电量 {_fmt_kwh(bill_total)}，"
+                            f"账单“{name}”段 {_fk(bv)} 高于账单总电量 {_fk(bill_total)}，"
                             f"疑似结算归集，不与过程逐段绝对值强比对。"
                         ),
                     }
                 )
                 continue
             diff = abs(pv - bv)
-            if diff < _ENERGY_TOL_RAW:
+            if diff < _ENERGY_TOL_KWH:
                 continue
-            # 一侧近 0、另一侧有电量 → 时段归属冲突
-            if (pv < _ENERGY_TOL_RAW) != (bv < _ENERGY_TOL_RAW) or diff >= _ENERGY_TOL_RAW:
-                if (pv < _ENERGY_TOL_RAW and bv >= _ENERGY_TOL_RAW) or (
-                    bv < _ENERGY_TOL_RAW and pv >= _ENERGY_TOL_RAW
+            if (pv < _ENERGY_TOL_KWH) != (bv < _ENERGY_TOL_KWH) or diff >= _ENERGY_TOL_KWH:
+                if (pv < _ENERGY_TOL_KWH and bv >= _ENERGY_TOL_KWH) or (
+                    bv < _ENERGY_TOL_KWH and pv >= _ENERGY_TOL_KWH
                 ):
                     checks.append(
                         {
                             "ok": False,
                             "code": "TOU_SLOT_MISMATCH",
                             "message": (
-                                f"分时“{name}”段不一致：过程 {_fmt_kwh(pv)}，账单 {_fmt_kwh(bv)}。"
+                                f"分时“{name}”段不一致：过程 {_fk(pv)}，账单 {_fk(bv)}。"
                             ),
                         }
                     )
                 elif proc_dom == bill_dom and name == proc_dom:
-                    # 同主导时段但量差异大
                     checks.append(
                         {
                             "ok": False,
                             "code": "TOU_AMOUNT_MISMATCH",
                             "message": (
-                                f"分时“{name}”段电量差异较大：过程 {_fmt_kwh(pv)}，"
-                                f"账单 {_fmt_kwh(bv)}，相差 {_fmt_kwh(diff)}。"
+                                f"分时“{name}”段电量差异较大：过程 {_fk(pv)}，"
+                                f"账单 {_fk(bv)}，相差 {_fk(diff)}。"
                             ),
                         }
                     )
@@ -493,8 +975,8 @@ def _check_process_vs_bill(
                 "ok": True,
                 "code": "TOU_PARTIAL",
                 "message": (
-                    f"分时仅一侧有数据：过程 {_fmt_tou_brief(proc_tou)}；"
-                    f"账单 {_fmt_tou_brief(bill_tou)}。"
+                    f"分时仅一侧有数据：过程 {_tou_brief_kwh(proc_tou)}；"
+                    f"账单 {_tou_brief_kwh(bill_tou)}。"
                 ),
             }
         )
@@ -510,10 +992,30 @@ def _check_process_vs_bill(
     return checks
 
 
-def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any]:
-    sid = (service_id or "").strip() or None
+def analyze_order_log(
+    text: str,
+    service_id: str | None = None,
+    trade_no: str | None = None,
+) -> dict[str, Any]:
+    from evcpa.multi_order import build_multi_order_choice, combine_filter
+
+    filter_id = combine_filter(service_id, trade_no)
+    sid = filter_id
+    # 未指定筛选时，先扫描是否存在多笔订单
+    if not sid:
+        discovered = _discover_orders(text)
+        if len(discovered) > 1:
+            pile = next((o.get("pile") for o in discovered if o.get("pile")), None)
+            return build_multi_order_choice(
+                discovered,
+                protocol="order_log",
+                protocol_name="充电订单日志",
+                pile=pile,
+            )
+
     lines = text.splitlines()
     remote = None
+    remote_stop = None
     start_frame = None
     records: list[dict[str, Any]] = []
     bills: list[dict[str, Any]] = []
@@ -521,6 +1023,7 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
     chgs: list[dict[str, Any]] = []
     gun_events: list[tuple[str, str, str]] = []
     has_remote_stop = False
+    remote_stop_msg: str | None = None
     start_ok = False
     card_auth = False
     vin_auth = False
@@ -534,12 +1037,19 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
         if m:
             obj = _load_json(m.group(1))
             if obj and _match_service(obj, sid):
-                remote = obj
+                cmd = _remote_cmd_str(obj)
                 matched_guns.add(str(obj.get("interfaceCode") or (obj.get("data") or {}).get("interfaceCode") or ""))
                 matched_trade_nos |= _ids_of(obj)
-                cmd = str(obj.get("remoteCmd", ""))
-                if cmd and cmd not in {"17", "1", "03", "14"} and "停止" in ln:
+                if cmd in _REMOTE_STOP_CMDS or (cmd and cmd not in _REMOTE_START_CMDS and ("停止" in ln or cmd == "18")):
                     has_remote_stop = True
+                    remote_stop = obj
+                    msg = _extract_stop_reason_msg(obj)
+                    if msg:
+                        remote_stop_msg = msg
+                elif cmd in _REMOTE_START_CMDS or not remote:
+                    # 保留启动令；停止令不覆盖 remote
+                    if cmd in _REMOTE_START_CMDS or remote is None:
+                        remote = obj
         m = _REMOTE_START.search(ln)
         if m:
             obj = _load_json(m.group(1))
@@ -570,12 +1080,26 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
                 if obj.get("interfaceCode") is not None:
                     matched_guns.add(str(obj.get("interfaceCode")))
                 matched_trade_nos |= _ids_of(obj)
-        m = _BILL_CMD8.search(ln)
+        m = _BILL_CMD8.search(ln) or _BILL_ANY.search(ln)
         if m:
             obj = _load_json(m.group(1))
             if obj and _match_service(obj, sid):
                 bills.append(obj)
                 matched_trade_nos |= _ids_of(obj)
+
+    # 万马等账单常只有 tradeNo、无 serviceId：按已匹配流水号补收账单
+    if not bills and matched_trade_nos:
+        for ln in lines:
+            m = _BILL_CMD8.search(ln) or _BILL_ANY.search(ln)
+            if not m:
+                continue
+            obj = _load_json(m.group(1))
+            if not obj:
+                continue
+            ids = _ids_of(obj)
+            if ids & matched_trade_nos or (not sid and obj):
+                bills.append(obj)
+                matched_trade_nos |= ids
 
     record = records[-1] if records else None
     bill = bills[-1] if bills else None
@@ -595,13 +1119,24 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
                     related = True
                     break
         if "远程停止" in ln and related:
-            has_remote_stop = True
+            # 「远程停止充电应答」仅为设备/平台应答，不能当作下发了远程停止命令
+            if any(ack in ln for ack in _REMOTE_STOP_ACK_ONLY):
+                pass
+            elif "RemoteCmd" in ln or "remoteCmd" in ln or "下发远程停止" in ln or "远程停止充电," in ln:
+                has_remote_stop = True
+                sm = re.search(r'"stopReasonMsg"\s*:\s*"([^"]*)"', ln)
+                if sm and sm.group(1).strip():
+                    remote_stop_msg = remote_stop_msg or sm.group(1).strip()
         if ("启动充电响应:成功" in ln or "远程启动充电响应，成功" in ln) and related:
             start_ok = True
         if related and any(m in ln for m in _CARD_START_MARKERS):
             card_auth = True
             start_ok = True
         if related and any(m in ln for m in _VIN_START_MARKERS):
+            vin_auth = True
+            start_ok = True
+        # 万马等：创建VIN码充电服务信息成功 / MsgHandler VIN充电
+        if related and ("创建VIN" in ln or "【MsgHandler】VIN" in ln or "MsgHandler】VIN" in ln):
             vin_auth = True
             start_ok = True
         if related and "鉴权结果" in ln and "刷卡" not in ln:
@@ -619,6 +1154,8 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
             gun_no = gm.group(1)
             if (not sid) or (not matched_guns) or (gun_no in matched_guns):
                 gun_events.append((ts_m.group(1) if ts_m else "", gun_no, gm.group(2)))
+                if gm.group(2) == "TROUBLE":
+                    fault = True
 
     # 指定了 serviceId 但没有任何业务 JSON 命中
     if sid and not (remote or start_frame or record or bill or socs or chgs):
@@ -771,15 +1308,48 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
     soc_vals = [s.get("soc") for s in socs if s.get("soc") is not None]
     soc_nonzero = any(v not in (0, None) for v in soc_vals)
 
-    start_meter = src.get("chargeStartMeterBattery") or (bill or {}).get("startMeterBattery")
-    end_meter = src.get("chargeEndMeterBattery") or (bill or {}).get("endMeterBattery")
+    start_meter = None
+    end_meter = None
+    meter_scale = 1000
+    if isinstance(src, dict) and src.get("chargeStartMeterBattery") is not None:
+        start_meter = src.get("chargeStartMeterBattery")
+        end_meter = src.get("chargeEndMeterBattery")
+        meter_scale = _accuracy_scale(src, 1000)
+    elif isinstance(bill, dict) and bill.get("startMeterBattery") is not None:
+        start_meter = bill.get("startMeterBattery")
+        end_meter = bill.get("endMeterBattery")
+        meter_scale = _accuracy_scale(bill, 1000)
+    else:
+        start_meter = (src or {}).get("chargeStartMeterBattery") if isinstance(src, dict) else None
+        end_meter = (src or {}).get("chargeEndMeterBattery") if isinstance(src, dict) else None
+        if start_meter is None and isinstance(bill, dict):
+            start_meter = bill.get("startMeterBattery")
+            end_meter = bill.get("endMeterBattery")
+            meter_scale = _accuracy_scale(bill, 1000)
+        elif isinstance(src, dict):
+            meter_scale = _accuracy_scale(src, 1000)
+
+    src_scale = _accuracy_scale(src if isinstance(src, dict) else None, 1000)
     total_batt = src.get("totalBattery") or (bill or {}).get("totalBattery")
+    # 主展示电量若来自账单，用账单精度
+    if src.get("totalBattery") is None and isinstance(bill, dict) and bill.get("totalBattery") is not None:
+        display_scale = _accuracy_scale(bill, 1000)
+    else:
+        display_scale = src_scale
     duration = src.get("chargeDuration") or (chgs[-1].get("chargeDuration") if chgs else None)
 
     jian = src.get("jianBattery", 0) or 0
     feng = src.get("fengBattery", 0) or 0
     ping = src.get("pingBattery", 0) or 0
     gu = src.get("guBattery", 0) or 0
+    # 分时若结算侧无值而账单有，回落到账单（并切换精度）
+    tou_scale = display_scale
+    if not any(float(x or 0) > 0 for x in (jian, feng, ping, gu)) and isinstance(bill, dict):
+        jian = bill.get("jianBattery", 0) or 0
+        feng = bill.get("fengBattery", 0) or 0
+        ping = bill.get("pingBattery", 0) or 0
+        gu = bill.get("guBattery", 0) or 0
+        tou_scale = _accuracy_scale(bill, 1000)
     jian_p, feng_p, ping_p, gu_p = src.get("jianPrice"), src.get("fengPrice"), src.get("pingPrice"), src.get("guPrice")
 
     # 过程帧：取本单 chargingInfo 中累计电量最大的一帧（接近结束）
@@ -787,9 +1357,12 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
     if chgs:
         proc_frame = max(chgs, key=lambda x: float(x.get("totalBattery") or 0))
     bill_src = bill or record
-    energy_checks = _check_process_vs_bill(proc_frame, bill_src, start_meter, end_meter)
+    bill_scale = _accuracy_scale(bill_src if isinstance(bill_src, dict) else None, 1000)
+    proc_scale = _accuracy_scale(proc_frame, 1000)
+    energy_checks = _check_process_vs_bill(
+        proc_frame, bill_src, start_meter, end_meter, meter_scale=meter_scale
+    )
     energy_mismatch = any(not c.get("ok", True) for c in energy_checks)
-
     charge_money = src.get("chargeMoney") or src.get("serverChargeMoney")
     service_money = src.get("serviceMoney") or src.get("serverServiceMoney")
     parking_money = src.get("parkingMoney") or src.get("serverParkingMoney") or 0
@@ -799,9 +1372,38 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
     finish_code = src.get("deviceChargeFinishReasonCode")
     if finish_code is None:
         finish_code = src.get("chargeFinishReason")
+    if finish_code is None and isinstance(bill, dict):
+        finish_code = bill.get("stopReason") or bill.get("deviceChargeFinishReasonCode")
     finish_msg = src.get("deviceChargeFinishReasonMsg") or "-"
+    if (not finish_msg or finish_msg == "-") and isinstance(bill, dict):
+        finish_msg = (
+            bill.get("deviceChargeFinishReasonMsg")
+            or bill.get("chargeFinishReasonMsg")
+            or bill.get("stopReasonMsg")
+            or finish_msg
+        )
+    # 万马等账单只有 stopReason 代码、无中文说明
+    if (not finish_msg or finish_msg == "-") and finish_code is not None and str(finish_code).strip() not in {"", "-", "0"}:
+        finish_msg = f"结束代码 {finish_code}"
+    if not remote_stop_msg and remote_stop:
+        remote_stop_msg = _extract_stop_reason_msg(remote_stop)
 
-    # 时间
+    # 账单 startWay 并入 src 供启动方式识别
+    if isinstance(src, dict) and src.get("startWay") is None and isinstance(bill, dict) and bill.get("startWay") is not None:
+        src = {**src, "startWay": bill.get("startWay"), "carvin": src.get("carvin") or bill.get("carvin")}
+
+    stop_info = _analyze_stop(
+        has_remote_stop=has_remote_stop,
+        remote_stop_msg=remote_stop_msg,
+        finish_msg=None if finish_msg == "-" else finish_msg,
+        finish_code=finish_code,
+        gun_events=gun_events,
+        gun=gun,
+    )
+    # 急停/故障类在结论里需要提示确认
+    need_user_confirm = stop_info["category"] in {"estop_suspect", "gun_fault"}
+
+    # 时间：账单 BCD → 结算/账单 unix/ISO → 枪状态行
     start_time = "-"
     end_time = "-"
     ready_ts = ""
@@ -814,18 +1416,29 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
             if not charge_start_ts:
                 charge_start_ts = ts
             charge_end_ts = ts
-    if bill and bill.get("startTime"):
-        st = str(bill["startTime"])
-        if len(st) >= 12 and st[:2].isdigit():
-            start_time = f"20{st[0:2]}-{st[2:4]}-{st[4:6]} {st[6:8]}:{st[8:10]}:{st[10:12]}"
-    elif charge_start_ts:
+
+    for obj in (bill, record, src if isinstance(src, dict) else None):
+        if not isinstance(obj, dict):
+            continue
+        st = _parse_log_time(obj.get("startTime"))
+        et = _parse_log_time(obj.get("endTime"))
+        if st and start_time == "-":
+            start_time = st
+        if et and end_time == "-":
+            end_time = et
+        if start_time != "-" and end_time != "-":
+            break
+    if start_time == "-" and charge_start_ts:
         start_time = charge_start_ts[:19]
-    if bill and bill.get("endTime"):
-        et = str(bill["endTime"])
-        if len(et) >= 12 and et[:2].isdigit():
-            end_time = f"20{et[0:2]}-{et[2:4]}-{et[4:6]} {et[6:8]}:{et[8:10]}:{et[10:12]}"
-    elif charge_end_ts:
+    if end_time == "-" and charge_end_ts:
         end_time = charge_end_ts[:19]
+
+    # 时长：优先 chargeDuration，否则用起止时间差
+    if duration in (None, "", "-", 0, "0"):
+        duration = _duration_seconds(
+            start_time if start_time != "-" else None,
+            end_time if end_time != "-" else None,
+        )
 
     stages: list[dict[str, Any]] = []
     detail = src.get("chargeStageDetail")
@@ -837,20 +1450,24 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
     elif isinstance(detail, list):
         stages = detail
 
-    total_kwh = _num(total_batt, 1000, 3)
-    ping_kwh = _num(ping, 1000, 3)
-    charge_yuan = _num(charge_money, 1000, 3)
-    service_yuan = _num(service_money, 1000, 3)
+    total_kwh = _num(total_batt, display_scale, 4)
+    ping_kwh = _num(ping, tou_scale, 4)
+    money_scale = src_scale
+    if src.get("chargeMoney") is None and isinstance(bill, dict) and bill.get("chargeMoney") is not None:
+        money_scale = _accuracy_scale(bill, 1000)
+    charge_yuan = _num(charge_money, money_scale, 4)
+    service_yuan = _num(service_money, money_scale, 4)
     total_fee = None
     if charge_money is not None or service_money is not None:
-        total_fee = _num((charge_money or 0) + (service_money or 0) + (parking_money or 0), 1000, 3)
-    ping_price = _num(ping_p, 1000, 3)
+        total_fee = _num(
+            (charge_money or 0) + (service_money or 0) + (parking_money or 0), money_scale, 4
+        )
+    ping_price = _num(ping_p, src_scale, 4)
     balance_yuan = _num(balance_raw, 1000, 3) if balance_raw is not None else None
-
     # ---- 组装客户报告文本 ----
     today = date.today()
     report_date = f"{today.year}年{today.month}月{today.day}日"
-    dur_text = f"约 {round(int(duration) / 60)} 分钟（{duration} 秒）" if duration else "-"
+    dur_text = _fmt_duration(duration)
     start_way = _infer_start_way(
         text,
         remote=remote if isinstance(remote, dict) else None,
@@ -930,9 +1547,9 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
         f"输出功率（范围）：{pwr_rng}",
         f"功率印证（电流×电压）：{pwr_check}",
         f"实时采样点数：{len(socs)}（按流水号 {trade_no} 过滤后的 socInfo）",
-        f"起始终端表码：{_fmt_kwh(start_meter)}",
-        f"结束终端表码：{_fmt_kwh(end_meter)}",
-        f"实际充电电量：{_fmt_kwh(total_batt)}",
+        f"起始终端表码：{_fmt_kwh(start_meter, meter_scale)}",
+        f"结束终端表码：{_fmt_kwh(end_meter, meter_scale)}",
+        f"实际充电电量：{_fmt_kwh(total_batt, display_scale)}",
         f"电池荷电状态：{'未上报（全程为 0）' if not soc_nonzero else '有上报'}",
         f"车辆识别码：{vin}",
         f"模块温度（范围）：{temp_rng}",
@@ -942,12 +1559,12 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
 
     out += _section("三、分时电量（尖 / 峰 / 平 / 谷）")
     out += [
-        f"尖：{_fmt_kwh(jian)}，电价 {_fmt_price(jian_p)}",
-        f"峰：{_fmt_kwh(feng)}，电价 {_fmt_price(feng_p)}",
-        f"平：{_fmt_kwh(ping)}"
+        f"尖：{_fmt_kwh(jian, tou_scale)}，电价 {_fmt_price(jian_p, src_scale)}",
+        f"峰：{_fmt_kwh(feng, tou_scale)}，电价 {_fmt_price(feng_p, src_scale)}",
+        f"平：{_fmt_kwh(ping, tou_scale)}"
         + ("（结算归集）" if ping_kwh and total_kwh and ping_kwh > total_kwh else "")
-        + f"，电价 {_fmt_price(ping_p)}",
-        f"谷：{_fmt_kwh(gu)}，电价 {_fmt_price(gu_p)}",
+        + f"，电价 {_fmt_price(ping_p, src_scale)}",
+        f"谷：{_fmt_kwh(gu, tou_scale)}，电价 {_fmt_price(gu_p, src_scale)}",
         "",
     ]
     if ping_kwh and total_kwh and ping_kwh > total_kwh + 0.01:
@@ -963,26 +1580,34 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
     if stages:
         stage_sum = sum(float(s.get("battery") or 0) for s in stages)
         out.append("")
-        out.append(f"分时段明细（各时段电量之和 = {_fmt_kwh(stage_sum)}）：")
+        out.append(f"分时段明细（各时段电量之和 = {_fmt_kwh(stage_sum, display_scale)}）：")
         for s in stages:
             note = ""
             # 简单提示首尾时段
             out.append(
-                f"{s.get('startTime', '?')} ～ {s.get('endTime', '?')}：{_fmt_kwh(s.get('battery'))}{note}"
+                f"{s.get('startTime', '?')} ～ {s.get('endTime', '?')}：{_fmt_kwh(s.get('battery'), display_scale)}{note}"
             )
-        out.append(f"合计：{_fmt_kwh(stage_sum)}")
+        out.append(f"合计：{_fmt_kwh(stage_sum, display_scale)}")
 
     out += _section("四、过程与账单校验")
-    out.append("说明：对比 chargingInfo（过程）与 recordInfo/账单（结算）；差值小于 1 kwh 视为可忽略。")
     out.append(
-        f"过程电量快照：总 {_fmt_kwh((proc_frame or {}).get('totalBattery'))}，"
-        f"{_fmt_tou_brief(_tou_map(proc_frame))}。"
+        "说明：对比 chargingInfo（过程）与 recordInfo/账单（结算）；"
+        "各侧按 accuracyFlag 换算（缺省千分位，蔚景账单常见万分位）；差值小于 1 kwh 视为可忽略。"
+    )
+    out.append(
+        f"过程电量快照：总 {_fmt_kwh((proc_frame or {}).get('totalBattery'), proc_scale)}，"
+        f"{_fmt_tou_brief(_tou_map(proc_frame), proc_scale)}。"
         if proc_frame
         else "过程电量快照：无 chargingInfo。"
     )
     out.append(
-        f"账单电量快照：总 {_fmt_kwh((bill_src or {}).get('totalBattery'))}，"
-        f"{_fmt_tou_brief(_tou_map(bill_src))}。"
+        f"账单电量快照：总 {_fmt_kwh((bill_src or {}).get('totalBattery'), bill_scale)}"
+        + (
+            f"（accuracyFlag={bill_src.get('accuracyFlag')}，÷{bill_scale}）"
+            if isinstance(bill_src, dict) and bill_src.get("accuracyFlag") is not None
+            else ""
+        )
+        + f"，{_fmt_tou_brief(_tou_map(bill_src), bill_scale)}。"
         if bill_src
         else "账单电量快照：无结算/账单数据。"
     )
@@ -996,18 +1621,18 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
 
     out += _section("五、费用明细")
     out += [
-        f"电费：{_fmt_money(charge_money)}",
-        f"服务费：{_fmt_money(service_money)}",
-        f"占桩费：{_fmt_money(parking_money) if parking_money else '0 元'}",
-        f"预约费：{_fmt_money(appoint_money) if appoint_money else '0 元'}",
-        f"费用合计：{_fmt_money((charge_money or 0)+(service_money or 0)+(parking_money or 0)) if charge_money is not None or service_money is not None else '-'}",
+        f"电费：{_fmt_money(charge_money, money_scale)}",
+        f"服务费：{_fmt_money(service_money, money_scale)}",
+        f"占桩费：{_fmt_money(parking_money, money_scale) if parking_money else '0 元'}",
+        f"预约费：{_fmt_money(appoint_money, money_scale) if appoint_money else '0 元'}",
+        f"费用合计：{_fmt_money((charge_money or 0)+(service_money or 0)+(parking_money or 0), money_scale) if charge_money is not None or service_money is not None else '-'}",
         "",
     ]
     if total_fee is not None and balance_yuan is not None:
         out.append(
             f"费用校验：电费 + 服务费 ≈ 启动余额 {balance_disp}，与结束原因“{finish_msg}”相符。"
             if finish_msg and finish_msg != "-"
-            else f"费用校验：费用合计约 {_fmt_money((charge_money or 0)+(service_money or 0)+(parking_money or 0))}，启动余额 {balance_disp}。"
+            else f"费用校验：费用合计约 {_fmt_money((charge_money or 0)+(service_money or 0)+(parking_money or 0), money_scale)}，启动余额 {balance_disp}。"
         )
     if ping_kwh and ping_price and charge_yuan is not None:
         calc = round(ping_kwh * ping_price, 3)
@@ -1026,12 +1651,19 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
     occupy_dur = "无计费占桩时长（结束后仅短暂占用状态约数秒，随后恢复空闲/待充）" if not has_occupy else "见平台占桩计费明细"
     out += [
         f"是否有远程停止指令：{remote_stop_text}",
-        f"设备结束原因：{finish_msg if not has_remote_stop else (finish_msg or '远程停止')}",
+        f"停止类型：{stop_info['stop_type']}",
+        f"停止原因：{stop_info['reason']}",
+        f"平台停止原因（stopReasonMsg）：{stop_info['platform_stop_reason']}",
+        f"设备结束原因（deviceChargeFinishReasonMsg）：{stop_info['device_finish_reason']}",
         f"结束原因代码：{finish_code if finish_code is not None else '-'}",
+        f"枪口状态变迁：{stop_info['gun_transition']}",
+        f"停止依据：{stop_info['evidence']}",
         f"是否占桩计费：{'是' if has_occupy else '否'}",
         f"占桩时长：{occupy_dur}",
-        f"占桩费用：{_fmt_money(parking_money) if parking_money else '0 元'}",
+        f"占桩费用：{_fmt_money(parking_money, money_scale) if parking_money else '0 元'}",
     ]
+    if stop_info.get("tip"):
+        out.append(f"提示：{stop_info['tip']}")
 
     out += _section("七、过程简述")
     steps: list[str] = []
@@ -1052,27 +1684,55 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
         steps.append(f"{n}. 进入充电中，电流、电压、功率稳定，持续上报实时数据。")
         n += 1
     if end_time != "-":
-        if finish_msg and finish_msg != "-" and not has_remote_stop:
+        if has_remote_stop:
+            steps.append(
+                f"{n}. {_cn_datetime(end_time)}　平台下发远程停止"
+                + (f"（{stop_info['reason']}）" if stop_info.get("reason") and stop_info["reason"] != "-" else "")
+                + "并完成结算。"
+            )
+        elif stop_info["category"] in {"device_unplug", "device_occupy", "device_idle_unplug"}:
+            steps.append(
+                f"{n}. {_cn_datetime(end_time)}　{stop_info['stop_type']}，"
+                f"设备上报“{stop_info['device_finish_reason']}”并上报账单。"
+            )
+        elif stop_info["category"] == "estop_suspect":
+            steps.append(
+                f"{n}. {_cn_datetime(end_time)}　枪口短暂故障后恢复，疑似急停；"
+                f"设备上报“{stop_info['device_finish_reason']}”。"
+            )
+        elif stop_info["category"] == "gun_fault":
+            steps.append(
+                f"{n}. {_cn_datetime(end_time)}　枪口故障停止，设备上报“{stop_info['device_finish_reason']}”。"
+            )
+        elif finish_msg and finish_msg != "-":
             steps.append(f"{n}. {_cn_datetime(end_time)}　设备按“{finish_msg}”结束充电并上报账单。")
-        elif has_remote_stop:
-            steps.append(f"{n}. {_cn_datetime(end_time)}　远程停止充电并完成结算。")
         else:
             steps.append(f"{n}. {_cn_datetime(end_time)}　充电结束并上报账单。")
         n += 1
     if offline:
-        steps.append(f"{n}. 过程中曾出现离线/超时记录，请结合现场确认。")
+        steps.append(f"{n}. 过程中曾出现离线/超时记录，需到设备上核实充电数据，请设备方协助排查。")
+        n += 1
+    if stop_info.get("tip"):
+        steps.append(f"{n}. {stop_info['tip']}")
         n += 1
     steps.append(f"{n}. 结束后枪口恢复空闲/待充" + ("，无离线、无故障告警记录。" if not offline and not fault else "。"))
     out.extend(steps or ["1. 已提取订单关键充电数据。"])
 
     out += _section("八、结论")
-    normal = bool(total_batt or socs) and not fault
-    if normal and not has_remote_stop and not energy_mismatch:
-        out.append("本订单为一次正常完成的交流充电订单。")
+    normal = bool(total_batt or socs) and not (stop_info["category"] in {"gun_fault"})
+    if need_user_confirm:
+        out.append(f"本订单停止类型为「{stop_info['stop_type']}」，需现场确认。")
+    elif normal and not has_remote_stop and not energy_mismatch and stop_info["category"] in {
+        "device_finish",
+        "device_unplug",
+        "device_occupy",
+        "device_idle_unplug",
+    }:
+        out.append(f"本订单为「{stop_info['stop_type']}」结束的充电订单。")
     elif energy_mismatch:
         out.append("本订单已提取完毕，但过程数据与账单校验存在差异，需重点复核。")
     elif has_remote_stop:
-        out.append("本订单为远程停止结束的充电订单。")
+        out.append("本订单为平台远程停止结束的充电订单。")
     else:
         out.append("本订单充电数据已提取完毕，请结合下列要点复核。")
     out.append("")
@@ -1100,21 +1760,42 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
     if energy_mismatch:
         bad = [c["message"] for c in energy_checks if not c.get("ok")]
         bullets.append("2. 过程与账单校验异常：" + ("；".join(bad[:2]) if bad else "电量或分时不一致。"))
-    elif not offline and not fault:
-        bullets.append("2. 充电期间无离线、无故障、无告警，也无平台远程停止指令。" if not has_remote_stop else "2. 订单由远程停止结束。")
+    elif has_remote_stop:
+        msg = f"2. 平台下发远程停止，停止原因：{stop_info['reason']}。"
+        if offline:
+            msg += "过程中曾出现离线，需到设备上核实充电数据，请设备方协助排查。"
+        bullets.append(msg)
+    elif stop_info["category"] == "estop_suspect":
+        bullets.append("2. 枪口曾短暂 TROUBLE 后恢复，疑似用户按下急停，请向现场确认。")
+    elif stop_info["category"] == "gun_fault":
+        bullets.append("2. 枪口进入 TROUBLE 并持续异常，判定为枪口故障停止。")
+    elif stop_info["category"] in {"device_unplug", "device_occupy", "device_idle_unplug"}:
+        msg = (
+            f"2. 无平台远程停止；{stop_info['stop_type']}，设备原因：{stop_info['device_finish_reason']}。"
+        )
+        if offline:
+            msg += "过程中曾出现离线，需到设备上核实充电数据，请设备方协助排查。"
+        bullets.append(msg)
+    elif offline:
+        bullets.append("2. 充电过程中出现离线/超时，需到设备上核实充电数据，请设备方协助排查。")
+    elif not fault:
+        bullets.append("2. 充电期间无离线、无故障、无告警，也无平台远程停止指令。")
     else:
-        bullets.append("2. 日志中存在离线或异常相关记录，建议人工复核。")
-    if finish_msg and finish_msg != "-":
-        fee_txt = _fmt_money((charge_money or 0) + (service_money or 0) + (parking_money or 0)) if charge_money is not None else "-"
-        if finish_msg == "金额截止":
+        bullets.append("2. 日志中存在异常相关记录，建议人工复核。")
+    if stop_info.get("reason") and stop_info["reason"] != "-":
+        fee_txt = (
+            _fmt_money((charge_money or 0) + (service_money or 0) + (parking_money or 0), money_scale)
+            if charge_money is not None
+            else "-"
+        )
+        if stop_info["device_finish_reason"] == "金额截止":
             bullets.append(
-                f"3. 订单因账户余额用尽（金额截止）正常结束，费用合计约 {fee_txt}"
+                f"3. 订单因账户余额用尽（金额截止）结束，费用合计约 {fee_txt}"
                 + ("，与启动余额一致。" if balance_disp != "-" else "。")
             )
         else:
             bullets.append(
-                f"3. 订单因“{finish_msg}”结束，费用合计约 {fee_txt}"
-                + ("，与启动余额一致。" if balance_disp != "-" else "。")
+                f"3. 停止类型「{stop_info['stop_type']}」，原因：{stop_info['reason']}；费用合计约 {fee_txt}。"
             )
     else:
         bullets.append("3. 已输出费用与停止相关字段。")
@@ -1127,6 +1808,12 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
             bullets.append(f"5. 分时电量以结算字段为准；实际充电量以表计 {total_kwh:.3f} kwh 为准。")
     if energy_mismatch:
         bullets.append("6. 过程与账单校验：发现不一致，详见“四、过程与账单校验”。")
+    if need_user_confirm and stop_info.get("tip"):
+        bullets.append(f"7. {stop_info['tip']}")
+    if offline and not any("需到设备上核实充电数据" in b for b in bullets):
+        bullets.append(
+            f"{len(bullets) + 1}. 过程中曾出现离线，需到设备上核实充电数据，请设备方协助排查。"
+        )
     out.extend(bullets)
     out.append("")
     if energy_mismatch:
@@ -1137,14 +1824,30 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
             "综合判断：过程与账单电量/分时不一致，请复核后再确认结算。\n"
             "需到设备上核实相关数据，请设备方协助排查。"
         )
-    elif normal and not has_remote_stop and not offline and not fault:
-        out.append("综合判断：充电情况正常，结算与结束原因合理。")
+    elif need_user_confirm:
+        out.append(f"综合判断：{stop_info['stop_type']}，{stop_info.get('tip') or '请现场确认后再定性。'}")
+        out.append("需到设备上核实相关数据，请设备方协助排查。")
+        valid = False
+        verdict = (
+            f"综合判断：{stop_info['stop_type']}，{stop_info.get('tip') or '请现场确认后再定性。'}\n"
+            "需到设备上核实相关数据，请设备方协助排查。"
+        )
+    elif offline:
+        out.append("综合判断：充电过程中出现离线，需到设备上核实充电数据后再确认。")
+        out.append("需到设备上核实相关数据，请设备方协助排查。")
+        valid = False
+        verdict = (
+            "综合判断：充电过程中出现离线，需到设备上核实充电数据后再确认。\n"
+            "需到设备上核实相关数据，请设备方协助排查。"
+        )
+    elif has_remote_stop:
+        out.append("综合判断：平台远程停止流程完整，结算数据可核对。")
         valid = True
-        verdict = "综合判断：充电情况正常，结算与结束原因合理。"
-    elif has_remote_stop and not fault:
-        out.append("综合判断：远程停止流程完整，结算数据可核对。")
+        verdict = "综合判断：平台远程停止流程完整，结算数据可核对。"
+    elif normal and not offline and stop_info["category"] != "unknown":
+        out.append(f"综合判断：{stop_info['stop_type']}，结算与结束原因可核对。")
         valid = True
-        verdict = "综合判断：远程停止流程完整，结算数据可核对。"
+        verdict = f"综合判断：{stop_info['stop_type']}，结算与结束原因可核对。"
     else:
         out.append("综合判断：请结合日志与现场情况复核。")
         out.append("需到设备上核实相关数据，请设备方协助排查。")
@@ -1185,20 +1888,24 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
         {"name": "输出功率（范围）", "value": pwr_rng},
         {"name": "功率印证（电流×电压）", "value": pwr_check},
         {"name": "实时采样点数", "value": f"{len(socs)}（流水号 {trade_no}）"},
-        {"name": "起始终端表码", "value": _fmt_kwh(start_meter)},
-        {"name": "结束终端表码", "value": _fmt_kwh(end_meter)},
-        {"name": "实际充电电量", "value": _fmt_kwh(total_batt)},
+        {"name": "起始终端表码", "value": _fmt_kwh(start_meter, meter_scale)},
+        {"name": "结束终端表码", "value": _fmt_kwh(end_meter, meter_scale)},
+        {"name": "实际充电电量", "value": _fmt_kwh(total_batt, display_scale)},
         {
             "name": "过程电量（chargingInfo）",
-            "value": _fmt_kwh((proc_frame or {}).get("totalBattery")) if proc_frame else "-",
+            "value": _fmt_kwh((proc_frame or {}).get("totalBattery"), proc_scale) if proc_frame else "-",
         },
         {
             "name": "过程分时",
-            "value": _fmt_tou_brief(_tou_map(proc_frame)) if proc_frame else "-",
+            "value": _fmt_tou_brief(_tou_map(proc_frame), proc_scale) if proc_frame else "-",
         },
         {
             "name": "账单分时",
-            "value": _fmt_tou_brief(_tou_map(bill_src)) if bill_src else "-",
+            "value": _fmt_tou_brief(_tou_map(bill_src), bill_scale) if bill_src else "-",
+        },
+        {
+            "name": "账单总电量",
+            "value": _fmt_kwh((bill_src or {}).get("totalBattery"), bill_scale) if bill_src else "-",
         },
         {
             "name": "过程与账单校验",
@@ -1207,36 +1914,42 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
         {"name": "电池荷电状态", "value": "未上报（全程为 0）" if not soc_nonzero else "有上报"},
         {"name": "车辆识别码", "value": vin},
         {"name": "模块温度（范围）", "value": temp_rng},
-        {"name": "尖电量", "value": _fmt_kwh(jian)},
-        {"name": "峰电量", "value": _fmt_kwh(feng)},
-        {"name": "平电量", "value": _fmt_kwh(ping)},
-        {"name": "谷电量", "value": _fmt_kwh(gu)},
-        {"name": "尖电价", "value": _fmt_price(jian_p)},
-        {"name": "峰电价", "value": _fmt_price(feng_p)},
-        {"name": "平电价", "value": _fmt_price(ping_p)},
-        {"name": "谷电价", "value": _fmt_price(gu_p)},
-        {"name": "电费", "value": _fmt_money(charge_money)},
-        {"name": "服务费", "value": _fmt_money(service_money)},
-        {"name": "占桩费", "value": _fmt_money(parking_money) if parking_money else "0 元"},
-        {"name": "预约费", "value": _fmt_money(appoint_money) if appoint_money else "0 元"},
+        {"name": "尖电量", "value": _fmt_kwh(jian, tou_scale)},
+        {"name": "峰电量", "value": _fmt_kwh(feng, tou_scale)},
+        {"name": "平电量", "value": _fmt_kwh(ping, tou_scale)},
+        {"name": "谷电量", "value": _fmt_kwh(gu, tou_scale)},
+        {"name": "尖电价", "value": _fmt_price(jian_p, src_scale)},
+        {"name": "峰电价", "value": _fmt_price(feng_p, src_scale)},
+        {"name": "平电价", "value": _fmt_price(ping_p, src_scale)},
+        {"name": "谷电价", "value": _fmt_price(gu_p, src_scale)},
+        {"name": "电费", "value": _fmt_money(charge_money, money_scale)},
+        {"name": "服务费", "value": _fmt_money(service_money, money_scale)},
+        {"name": "占桩费", "value": _fmt_money(parking_money, money_scale) if parking_money else "0 元"},
+        {"name": "预约费", "value": _fmt_money(appoint_money, money_scale) if appoint_money else "0 元"},
         {
             "name": "费用合计",
-            "value": _fmt_money((charge_money or 0) + (service_money or 0) + (parking_money or 0))
+            "value": _fmt_money((charge_money or 0) + (service_money or 0) + (parking_money or 0), money_scale)
             if charge_money is not None or service_money is not None
             else "-",
         },
         {"name": "是否有远程停止指令", "value": "有" if has_remote_stop else "无"},
-        {"name": "设备结束原因", "value": finish_msg if finish_msg != "-" else "-"},
+        {"name": "停止类型", "value": stop_info["stop_type"]},
+        {"name": "停止原因", "value": stop_info["reason"]},
+        {"name": "平台停止原因", "value": stop_info["platform_stop_reason"]},
+        {"name": "设备结束原因", "value": stop_info["device_finish_reason"]},
         {"name": "结束原因代码", "value": str(finish_code) if finish_code is not None else "-"},
+        {"name": "枪口状态变迁", "value": stop_info["gun_transition"]},
+        {"name": "停止依据", "value": stop_info["evidence"]},
+        {"name": "停止提示", "value": stop_info["tip"] or "-"},
         {"name": "是否占桩计费", "value": "是" if has_occupy else "否"},
         {"name": "占桩时长", "value": occupy_dur},
-        {"name": "占桩费用", "value": _fmt_money(parking_money) if parking_money else "0 元"},
+        {"name": "占桩费用", "value": _fmt_money(parking_money, money_scale) if parking_money else "0 元"},
     ]
     for s in stages:
         info_fields.append(
             {
                 "name": f"分时段 {s.get('startTime', '?')}～{s.get('endTime', '?')}",
-                "value": _fmt_kwh(s.get("battery")),
+                "value": _fmt_kwh(s.get("battery"), display_scale),
             }
         )
 
@@ -1271,6 +1984,10 @@ def analyze_order_log(text: str, service_id: str | None = None) -> dict[str, Any
         "raw_json": None,
         "extras": {
             "has_remote_stop": has_remote_stop,
+            "stop_category": stop_info["category"],
+            "stop_type": stop_info["stop_type"],
+            "stop_reason": stop_info["reason"],
+            "need_user_confirm": need_user_confirm,
             "soc_samples": len(socs),
             "charging_samples": len(chgs),
             "service_id": sid or service_id_val,

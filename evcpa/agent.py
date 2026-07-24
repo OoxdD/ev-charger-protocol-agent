@@ -127,11 +127,15 @@ class ProtocolAgent:
         json_text: str | None = None,
         text: str | None = None,
         protocol: str | None = None,
+        service_id: str | None = None,
+        trade_no: str | None = None,
     ) -> dict[str, Any]:
         """分析入口：协议抓包日志 / 多帧 hex 自动拆包并汇总订单。"""
         blob = text or hex_text
         if blob and looks_like_protocol_trace_log(blob):
-            return self._analyze_protocol_trace_log(blob, protocol=protocol)
+            return self._analyze_protocol_trace_log(
+                blob, protocol=protocol, service_id=service_id, trade_no=trade_no
+            )
 
         if hex_text and not json_text:
             try:
@@ -139,7 +143,9 @@ class ProtocolAgent:
             except ValueError as e:
                 # 可能是夹杂时间戳的抓包文本
                 if looks_like_protocol_trace_log(hex_text):
-                    return self._analyze_protocol_trace_log(hex_text, protocol=protocol)
+                    return self._analyze_protocol_trace_log(
+                        hex_text, protocol=protocol, service_id=service_id, trade_no=trade_no
+                    )
                 return {
                     "protocol": "unknown",
                     "protocol_name": "未知",
@@ -151,7 +157,9 @@ class ProtocolAgent:
                 }
             frames = split_frames(raw)
             if len(frames) >= 2:
-                return self._analyze_multi_frames(frames, protocol=protocol)
+                return self._analyze_multi_frames(
+                    frames, protocol=protocol, service_id=service_id, trade_no=trade_no
+                )
             if len(frames) == 1:
                 one = self.analyze(
                     hex_text=to_hex(frames[0].data, spaced=False),
@@ -161,7 +169,14 @@ class ProtocolAgent:
         result = self.analyze(hex_text=hex_text, json_text=json_text, protocol=protocol)
         return result.to_pretty_dict()
 
-    def _analyze_protocol_trace_log(self, text: str, *, protocol: str | None = None) -> dict[str, Any]:
+    def _analyze_protocol_trace_log(
+        self,
+        text: str,
+        *,
+        protocol: str | None = None,
+        service_id: str | None = None,
+        trade_no: str | None = None,
+    ) -> dict[str, Any]:
         log_frames = extract_frames_from_protocol_log(text)
         if not log_frames:
             return {
@@ -211,7 +226,12 @@ class ProtocolAgent:
             results.append(r)
 
         if has_order_signal(results):
-            report = aggregate_frame_order(results, meta={"pile": pile, "source": "protocol_trace_log"})
+            report = aggregate_frame_order(
+                results,
+                meta={"pile": pile, "source": "protocol_trace_log"},
+                service_id=service_id,
+                trade_no=trade_no,
+            )
             report["extras"] = {
                 **(report.get("extras") or {}),
                 "source": "protocol_trace_log",
@@ -227,6 +247,8 @@ class ProtocolAgent:
                 if (lf.cmd_hint or "").upper() not in _LINK_CMD_HINTS
             ],
             protocol=protocol or "ykc",
+            service_id=service_id,
+            trade_no=trade_no,
         )
 
     def _analyze_multi_frames(
@@ -234,6 +256,8 @@ class ProtocolAgent:
         frames: list[Any],
         *,
         protocol: str | None = None,
+        service_id: str | None = None,
+        trade_no: str | None = None,
     ) -> dict[str, Any]:
         results: list[AnalysisResult] = []
         for fr in frames:
@@ -243,7 +267,9 @@ class ProtocolAgent:
             results.append(r)
 
         if has_order_signal(results):
-            report = aggregate_frame_order(results)
+            report = aggregate_frame_order(
+                results, service_id=service_id, trade_no=trade_no
+            )
             report["extras"] = {
                 **(report.get("extras") or {}),
                 "candidates": results[0].extras.get("candidates") if results else [],
