@@ -32,9 +32,24 @@
     if (!data) return false;
     if (data.mode === "multi_order_choice") return false;
     if (data.valid === false) return true;
+    const ex = data.extras || {};
+    if (ex.energy_mismatch || ex.start_mismatch || ex.need_user_confirm) return true;
     const warnings = data.warnings || [];
-    if (warnings.some((w) => w.level === "error" || w.level === "warn")) return true;
-    if (data.extras && data.extras.energy_mismatch) return true;
+    // 仅 error，或明确需现场核实的告警；普通 ORDER_FAULT 摘录不自动追加核实文案
+    const seriousCodes = new Set([
+      "ENERGY_DECREASE",
+      "TOU_INACTIVE_CHANGED",
+      "START_FAIL",
+      "ENERGY_MISMATCH",
+      "TOTAL_MISMATCH",
+      "TOU_DOM_MISMATCH",
+      "METER_MISMATCH",
+      "CRC_FAIL",
+      "BAD_START",
+      "LEN_MISMATCH",
+    ]);
+    if (warnings.some((w) => w.level === "error")) return true;
+    if (warnings.some((w) => seriousCodes.has(String(w.code || "")))) return true;
     return false;
   }
 

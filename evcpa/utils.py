@@ -5,15 +5,34 @@ from typing import Any
 
 
 _HEX_CLEAN = re.compile(r"[^0-9a-fA-F]")
+# 平台日志标签：【上报 0x13】/【下发 0x2002】，其中的 0xNN 不能并入报文 hex
+_LOG_DIR_TAG = re.compile(r"【\s*(?:上报|下发)\s*0x[0-9A-Fa-f]+\s*】", re.IGNORECASE)
+_FRAME_STARTS = (
+    "9955BBAA",  # 万马 LE
+    "AABB5599",  # 万马 BE
+    "68",        # 云快充/蔚景等
+)
 
 
 def parse_hex(text: str) -> bytes:
-    """Accept hex with spaces, 0x prefixes, commas, or continuous string."""
+    """Accept hex with spaces, 0x prefixes, commas, log tags, or continuous string."""
     cleaned = text.strip()
+    # 先去掉上报/下发标签，避免 0x2002 等命令字污染真实帧
+    cleaned = _LOG_DIR_TAG.sub(" ", cleaned)
     cleaned = cleaned.replace("0x", "").replace("0X", "")
     cleaned = _HEX_CLEAN.sub("", cleaned)
     if not cleaned:
         raise ValueError("空十六进制输入")
+    # 若混入前缀杂讯，对齐到已知帧头
+    upper = cleaned.upper()
+    cut = None
+    for start in _FRAME_STARTS:
+        idx = upper.find(start)
+        if idx >= 0 and (cut is None or idx < cut):
+            cut = idx
+    if cut is not None and cut > 0:
+        cleaned = cleaned[cut:]
+        upper = cleaned.upper()
     if len(cleaned) % 2 != 0:
         raise ValueError(f"十六进制长度必须为偶数，当前 {len(cleaned)}")
     return bytes.fromhex(cleaned)

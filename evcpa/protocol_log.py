@@ -15,17 +15,17 @@ _LINE_FRAME = re.compile(
     r"(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)"
     r".*?"
     r"【(?P<pile>[^】]+)】"
-    r"(?:【(?P<dir>上报|下发)\s*0x(?P<cmd>[0-9A-Fa-f]{2})】)?"
-    r"\s*(?P<hex>68[0-9A-Fa-f]{10,})",
+    r"(?:【(?P<dir>上报|下发)\s*0x(?P<cmd>[0-9A-Fa-f]{2,4})】)?"
+    r"\s*(?P<hex>(?:68|9955BBAA|AABB5599)[0-9A-Fa-f]{10,})",
     re.IGNORECASE,
 )
 
-# 兼容无桩号括号、仅有上报/下发标记的行
+# 兼容无桩号括号、仅有上报/下发标记的行（含万马 0x2002 等 4 位命令字）
 _LINE_FRAME_LOOSE = re.compile(
     r"(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)?"
     r".*?"
-    r"【(?P<dir>上报|下发)\s*0x(?P<cmd>[0-9A-Fa-f]{2})】"
-    r"\s*(?P<hex>68[0-9A-Fa-f]{10,})",
+    r"【(?P<dir>上报|下发)\s*0x(?P<cmd>[0-9A-Fa-f]{2,4})】"
+    r"\s*(?P<hex>(?:68|9955BBAA|AABB5599)[0-9A-Fa-f]{10,})",
     re.IGNORECASE,
 )
 
@@ -44,11 +44,16 @@ class LogFrame:
 def looks_like_protocol_trace_log(text: str) -> bool:
     if not text or len(text) < 40:
         return False
-    # 关键特征：日志时间 + 【上报/下发 0xNN】 + 68 帧
-    hit_dir = len(re.findall(r"【(?:上报|下发)\s*0x[0-9A-Fa-f]{2}】", text))
-    hit_68 = text.count("68")
+    # 强特征：日志时间 + 【上报/下发 0xNN】 + 已知帧头
+    hit_dir = len(re.findall(r"【(?:上报|下发)\s*0x[0-9A-Fa-f]{2,4}】", text))
+    hit_frame = len(
+        re.findall(r"(?i)(?:^|[^0-9A-Fa-f])(68|9955BBAA|AABB5599)[0-9A-Fa-f]{10,}", text)
+    )
     hit_ts = len(re.findall(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", text[:5000]))
-    return hit_dir >= 2 and hit_68 >= 2 and hit_ts >= 1
+    if hit_dir >= 2 and hit_frame >= 2 and hit_ts >= 1:
+        return True
+    # 单行粘贴：【上报 0x2002】 + 万马/云快充帧
+    return hit_dir >= 1 and hit_frame >= 1
 
 
 def extract_frames_from_protocol_log(text: str) -> list[LogFrame]:

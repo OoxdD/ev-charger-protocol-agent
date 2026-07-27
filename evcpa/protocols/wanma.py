@@ -157,13 +157,20 @@ class WanmaParser(ProtocolParser):
                 WarningItem(code="ACK_HAS_BODY", level="warn", message="确认报文通常无数据域")
             )
         if body_len and body_len % 16 != 0:
-            warnings.append(
-                WarningItem(
-                    code="BODY_ALIGN",
-                    level="warn",
-                    message=f"数据域长度 {body_len} 非 16 的倍数（协议要求填充 00H）",
-                )
+            rem = body_len % 16
+            trailing_ok = body_len >= rem and all(
+                b == 0 for b in raw[20 + body_len - rem : 20 + body_len]
             )
+            # 未加密可变长报文（如 0x4004 分时列表）常不补齐；CRC 已通过则不告警
+            if not trailing_ok:
+                # 稍后若 CRC 通过再决定是否保留；先记下，CRC 校验后再过滤
+                warnings.append(
+                    WarningItem(
+                        code="BODY_ALIGN",
+                        level="warn",
+                        message=f"数据域长度 {body_len} 非 16 的倍数（协议要求填充 00H）",
+                    )
+                )
 
         body = raw[20 : 20 + body_len] if body_len else b""
         crc_off = 20 + body_len
@@ -180,7 +187,10 @@ class WanmaParser(ProtocolParser):
                 )
             )
             fields.append(FieldItem(name="crc32_calc", value=f"0x{calc:08X}", meaning="本地计算 CRC32"))
-            if not ok:
+            if ok:
+                # 可变长数据域未按 16 对齐但 CRC 正确：视为设备未填填充，去掉误报
+                warnings[:] = [w for w in warnings if w.code != "BODY_ALIGN"]
+            else:
                 warnings.append(
                     WarningItem(
                         code="CRC_FAIL",
@@ -206,8 +216,9 @@ class WanmaParser(ProtocolParser):
             f"万马 {PROTOCOL_VERSION} {msg_name}（0x{msg:04X}），"
             f"设备={device or '-'}，序号={seq}，数据域 {body_len} 字节"
         )
-        if warnings:
-            summary += f"；发现 {len(warnings)} 个问题"
+        issues = [w for w in warnings if w.level in ("warn", "error")]
+        if issues:
+            summary += f"；发现 {len(issues)} 个问题"
 
         # CRC 未校准时不因 CRC_FAIL 判为无效帧（文档未给多项式）
         hard_errors = [w for w in warnings if w.level == "error"]
@@ -249,6 +260,8 @@ class WanmaParser(ProtocolParser):
             return []
         if msg == 0x2000:
             return self._parse_status(body)
+        if msg == 0x2002:
+            return self._parse_pile_data(body)
         if msg == 0x4000:
             return self._parse_start_cmd(body)
         if msg == 0x4002:
@@ -387,6 +400,198 @@ class WanmaParser(ProtocolParser):
             off += 16
         return items
 
+    @staticmethod
+    def _scale_voltage_v(raw: int) -> float | None:
+        """电压原始值：优先 0.01V，其次 0.1V，落在 50~1000V。"""
+        for div, nd in ((100.0, 2), (10.0, 1)):
+            v = raw / div
+            if 50.0 <= v <= 1000.0:
+                return round(v, nd)
+        return None
+
+    @staticmethod
+    def _scale_current_a(raw: int) -> float | None:
+        """电流原始值：优先 0.01A，其次 0.1A / 1A，落在 0~600A。"""
+        for div, nd in ((100.0, 2), (10.0, 1), (1.0, 0)):
+            c = raw / div
+            if 0.0 <= c <= 600.0:
+                return round(c, nd)
+        return None
+
+    def _parse_pile_data(self, body: bytes) -> list[FieldItem]:
+        """0x2002 电桩数据：表码/额定值 + 枪口电压电流等。"""
+        items: list[FieldItem] = []
+        if len(body) < 8:
+            items.append(
+                FieldItem(
+                    name="body_hex",
+                    value=to_hex(body, spaced=False),
+                    offset=20,
+                    length=len(body),
+                    meaning="电桩数据原始域",
+                )
+            )
+            return items
+
+        # 头部常见：累计电表(0.001kWh) + 额定电压/电流(1V/1A，多在偏移 16)
+        if self._need(body, 0, 4):
+            meter = read_u32_le(body, 0)
+            if 0 < meter < 50_000_000:
+                items.append(
+                    FieldItem(
+                        name="meter_value",
+                        value=round(meter / 1000.0, 3),
+                        offset=20,
+                        length=4,
+                        unit="kWh",
+                        meaning="电表读数",
+                    )
+                )
+        if self._need(body, 4, 4):
+            meter2 = read_u32_le(body, 4)
+            if 0 < meter2 < 50_000_000:
+                items.append(
+                    FieldItem(
+                        name="meter_value_2",
+                        value=round(meter2 / 1000.0, 3),
+                        offset=24,
+                        length=4,
+                        unit="kWh",
+                        label="电表读数2",
+                        meaning="第二路/接口电表读数",
+                    )
+                )
+        if self._need(body, 16, 4):
+            rated_v = read_u16_le(body, 16)
+            rated_i = read_u16_le(body, 18)
+            if 50 <= rated_v <= 1000 and 1 <= rated_i <= 600:
+                items.append(
+                    FieldItem(
+                        name="rated_voltage",
+                        value=rated_v,
+                        offset=36,
+                        length=2,
+                        unit="V",
+                        label="额定电压",
+                        meaning="额定输出电压",
+                    )
+                )
+                items.append(
+                    FieldItem(
+                        name="rated_current",
+                        value=rated_i,
+                        offset=38,
+                        length=2,
+                        unit="A",
+                        label="额定电流",
+                        meaning="额定输出电流",
+                    )
+                )
+
+        # 枪口实时段：port(1~8) + 状态 + 电压 + 电流（可能有多处误对齐，打分择优）
+        candidates: list[tuple[int, int, int, float, float, int]] = []
+        for off in range(0, len(body) - 5):
+            gun = body[off]
+            st = body[off + 1]
+            if gun < 1 or gun > 8 or st not in WANMA_GUN_WORK:
+                continue
+            volt_raw = read_u16_le(body, off + 2)
+            curr_raw = read_u16_le(body, off + 4)
+            volt = self._scale_voltage_v(volt_raw)
+            curr = self._scale_current_a(curr_raw)
+            if volt is None or curr is None:
+                continue
+            # 避免把额定 500V/500A 误当成实时输出
+            if off <= 18 and self._need(body, 16, 4):
+                if volt_raw == read_u16_le(body, 16) and curr_raw == read_u16_le(body, 18):
+                    continue
+            score = 0
+            if 200.0 <= volt <= 800.0:
+                score += 3
+            elif 50.0 <= volt <= 1000.0:
+                score += 1
+            if 1.0 <= curr <= 500.0:
+                score += 2
+            power_kw = volt * curr / 1000.0
+            if 3.0 <= power_kw <= 400.0:
+                score += 3
+            if st == 2:
+                score += 2
+            elif st == 1:
+                score += 1
+            if off >= 1 and body[off - 1] == 0:
+                score += 1
+            # 电压偏低但电流很大，多半是错位
+            if volt < 150.0 and curr > 150.0:
+                score -= 2
+            candidates.append((score, off, gun, st, volt, curr))
+
+        gun_off: int | None = None
+        if candidates:
+            candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            _score, off, gun, st, volt, curr = candidates[0]
+            gun_off = off
+            items.append(
+                FieldItem(
+                    name="gun_no",
+                    value=gun,
+                    offset=20 + off,
+                    length=1,
+                    meaning="接口标识",
+                )
+            )
+            items.append(
+                FieldItem(
+                    name=f"gun_{gun}_status",
+                    value=st,
+                    offset=20 + off + 1,
+                    length=1,
+                    label=f"接口{gun}工作状态",
+                    meaning=WANMA_GUN_WORK.get(st, str(st)),
+                )
+            )
+            items.append(
+                FieldItem(
+                    name="output_voltage",
+                    value=volt,
+                    offset=20 + off + 2,
+                    length=2,
+                    unit="V",
+                    meaning="输出电压",
+                )
+            )
+            items.append(
+                FieldItem(
+                    name="output_current",
+                    value=curr,
+                    offset=20 + off + 4,
+                    length=2,
+                    unit="A",
+                    meaning="输出电流",
+                )
+            )
+            items.append(
+                FieldItem(
+                    name="output_power",
+                    value=round(volt * curr / 1000.0, 2),
+                    unit="kW",
+                    label="输出功率(估算)",
+                    meaning="电压×电流",
+                )
+            )
+
+        items.append(
+            FieldItem(
+                name="body_hex",
+                value=to_hex(body, spaced=False),
+                offset=20,
+                length=len(body),
+                meaning="电桩数据原始域"
+                + (f"；枪口段偏移 body+{gun_off}" if gun_off is not None else "（未识别到枪口电气段）"),
+            )
+        )
+        return items
+
     def _parse_start_cmd(self, body: bytes) -> list[FieldItem]:
         items: list[FieldItem] = []
         o = 0
@@ -457,7 +662,10 @@ class WanmaParser(ProtocolParser):
         return items
 
     def _parse_energy(self, body: bytes) -> list[FieldItem]:
+        """0x4004 充电电量数据（对齐爱充 wmp_charge_data + slot 列表）。"""
         items: list[FieldItem] = []
+        tou_names = {0: "尖", 1: "峰", 2: "平", 3: "谷"}
+
         if self._need(body, 0, 1):
             items.append(FieldItem(name="gun_no", value=body[0], offset=20, length=1, meaning="接口标识"))
         if self._need(body, 1, 1):
@@ -495,6 +703,102 @@ class WanmaParser(ProtocolParser):
                     meaning="充电总费用",
                 )
             )
+        if self._need(body, 16, 2):
+            need = read_u16_le(body, 16)
+            # 部分桩把剩余分钟写成高字节（如 00 0F → 本应 15）
+            if need > 24 * 60 and body[16] == 0 and 0 < body[17] <= 24 * 60:
+                need = body[17]
+            items.append(
+                FieldItem(
+                    name="need_time_min",
+                    value=need,
+                    offset=36,
+                    length=2,
+                    unit="min",
+                    label="剩余充电时间",
+                    meaning="剩余充电时间",
+                )
+            )
+
+        # ProtocolObjList：1 字节条数 + N×8 字节时段
+        # 时段布局：序号(1) + 保留(1) + 单价0.0001元(2) + 电量0.001kWh(4)
+        if self._need(body, 19, 1):
+            n = body[19]
+            items.append(
+                FieldItem(
+                    name="slot_count",
+                    value=n,
+                    offset=39,
+                    length=1,
+                    label="分时段数",
+                    meaning="分时电量段数",
+                )
+            )
+            off = 20
+            slot_energy_sum = 0.0
+            # 先扫一遍：若存在 >3 的序号，按半小时费率时段解释；否则按尖峰平谷
+            indices: list[int] = []
+            for i in range(n):
+                if self._need(body, off + i * 8, 1):
+                    indices.append(body[off + i * 8])
+            use_tou_name = bool(indices) and max(indices) <= 3
+
+            for i in range(n):
+                if not self._need(body, off, 8):
+                    items.append(
+                        FieldItem(
+                            name="slot_truncated",
+                            value=True,
+                            meaning=f"分时列表声明 {n} 段，实际仅解析到 {i} 段",
+                        )
+                    )
+                    break
+                idx = body[off]
+                price_raw = read_u16_le(body, off + 2)
+                energy_raw = read_u32_le(body, off + 4)
+                energy = round(energy_raw / 1000.0, 3)
+                price = round(price_raw / 10000.0, 4)
+                slot_energy_sum += energy
+                if use_tou_name and idx in tou_names:
+                    label = f"分时{tou_names[idx]}"
+                    name = f"tou_{tou_names[idx]}_energy"
+                else:
+                    # 0~47 常见为半小时费率时段号
+                    label = f"分时时段{idx}"
+                    name = f"slot_{idx}_energy"
+                items.append(
+                    FieldItem(
+                        name=name,
+                        value=energy,
+                        offset=20 + off,
+                        length=8,
+                        unit="kWh",
+                        label=label,
+                        meaning=f"{label}电量；单价 {price} 元/kWh",
+                    )
+                )
+                items.append(
+                    FieldItem(
+                        name=f"{name}_price",
+                        value=price,
+                        offset=20 + off + 2,
+                        length=2,
+                        unit="元/kWh",
+                        label=f"{label}单价",
+                        meaning="时段电价（含服务费口径以设备为准）",
+                    )
+                )
+                off += 8
+            if n and slot_energy_sum > 0:
+                items.append(
+                    FieldItem(
+                        name="slot_energy_sum",
+                        value=round(slot_energy_sum, 3),
+                        unit="kWh",
+                        label="分时电量合计",
+                        meaning="各分时段电量之和",
+                    )
+                )
         return items
 
     def _parse_trade(self, body: bytes) -> list[FieldItem]:

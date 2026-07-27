@@ -11,7 +11,7 @@ from evcpa.protocol_log import extract_frames_from_protocol_log, looks_like_prot
 from evcpa.protocols import all_parsers
 from evcpa.utils import looks_like_json, parse_hex, safe_json_loads, to_hex
 
-# 抓包日志中心跳帧可不做完整业务解析，仅计数
+# 抓包日志中心跳帧可不做完整业务解析，仅计数（云快充 0x03/0x04）
 _LINK_CMD_HINTS = {"03", "04"}
 _PRIORITY_CMD_HINTS = {
     "13",
@@ -33,6 +33,22 @@ _PRIORITY_CMD_HINTS = {
     "41",
     "42",
 }
+
+_WANMA_MAGIC_LE = bytes.fromhex("AABB5599")
+_WANMA_MAGIC_BE = bytes.fromhex("9955BBAA")
+
+
+def _protocol_hint_from_bytes(data: bytes, cmd_hint: str | None = None) -> str | None:
+    """按帧头/命令字给出协议提示；无法判断时返回 None 交给自动识别。"""
+    if len(data) >= 4 and data[:4] in (_WANMA_MAGIC_LE, _WANMA_MAGIC_BE):
+        return "wanma"
+    cmd = (cmd_hint or "").upper()
+    # 万马命令字多为 4 位（如 2002）；云快充多为 2 位
+    if len(cmd) == 4:
+        return "wanma"
+    if data[:1] == b"\x68":
+        return "ykc"
+    return None
 
 
 class ProtocolAgent:
@@ -195,7 +211,9 @@ class ProtocolAgent:
 
         for lf in log_frames:
             cmd = (lf.cmd_hint or "").upper()
-            if cmd in _LINK_CMD_HINTS:
+            hint = _protocol_hint_from_bytes(lf.data, cmd)
+            # 仅云快充链路心跳做占位；万马等其它协议完整解析
+            if cmd in _LINK_CMD_HINTS and hint in (None, "ykc"):
                 skipped_link += 1
                 # 用轻量占位结果计入统计
                 results.append(
@@ -215,7 +233,8 @@ class ProtocolAgent:
                 )
                 continue
 
-            forced = protocol or "ykc"
+            # 未指定协议时按帧头提示，再不行走自动识别（勿默认强制云快充）
+            forced = protocol or hint
             r = self.analyze(hex_text=lf.hex_text, protocol=forced)
             r.extras = {
                 **(r.extras or {}),
@@ -224,6 +243,18 @@ class ProtocolAgent:
                 "log_dir": lf.direction,
             }
             results.append(r)
+
+        detail_results = [r for r in results if not (r.extras or {}).get("skipped_detail")]
+        # 单行粘贴（仅 1 帧）：直接展示字段，不走订单汇总
+        if len(detail_results) == 1 and len(log_frames) == 1:
+            one = detail_results[0].to_pretty_dict()
+            one["extras"] = {
+                **(one.get("extras") or {}),
+                "source": "protocol_trace_log",
+                "extracted_frames": 1,
+                "link_placeholder": skipped_link,
+            }
+            return one
 
         if has_order_signal(results):
             report = aggregate_frame_order(
@@ -240,13 +271,34 @@ class ProtocolAgent:
             }
             return report
 
+        if len(detail_results) == 1:
+            one = detail_results[0].to_pretty_dict()
+            one["extras"] = {
+                **(one.get("extras") or {}),
+                "source": "protocol_trace_log",
+                "extracted_frames": len(log_frames),
+                "link_placeholder": skipped_link,
+            }
+            return one
+
         return self._analyze_multi_frames(
             [
-                type("F", (), {"data": lf.data, "offset": lf.line_no, "protocol_hint": "ykc"})()
+                type(
+                    "F",
+                    (),
+                    {
+                        "data": lf.data,
+                        "offset": lf.line_no,
+                        "protocol_hint": _protocol_hint_from_bytes(lf.data, lf.cmd_hint),
+                    },
+                )()
                 for lf in log_frames
-                if (lf.cmd_hint or "").upper() not in _LINK_CMD_HINTS
+                if not (
+                    (lf.cmd_hint or "").upper() in _LINK_CMD_HINTS
+                    and _protocol_hint_from_bytes(lf.data, lf.cmd_hint) in (None, "ykc")
+                )
             ],
-            protocol=protocol or "ykc",
+            protocol=protocol,
             service_id=service_id,
             trade_no=trade_no,
         )
@@ -337,11 +389,12 @@ class ProtocolAgent:
             lines.append(f"帧类型: {result.frame_type_name or ''} [{result.frame_type}]")
         if result.direction:
             lines.append(f"方向: {result.direction}")
-        if result.warnings:
+        hard_warns = [w for w in result.warnings if w.level in ("warn", "error")]
+        if hard_warns:
             lines.append("告警/问题:")
-            for w in result.warnings:
+            for w in hard_warns:
                 lines.append(f"  - [{w.level}] {w.code}: {w.message}")
-        if result.warnings or not result.valid:
+        if hard_warns or not result.valid:
             lines.append("需到设备上核实相关数据，请设备方协助排查。")
         if result.fields:
             lines.append("关键字段:")

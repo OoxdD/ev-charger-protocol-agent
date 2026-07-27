@@ -43,6 +43,25 @@ _REMOTE_STOP_ACK_ONLY = (
     "远程停止应答",
 )
 
+# 离线/掉电/重连相关（日志文案或设备结束原因）
+_OFFLINE_LOG_MARKERS = (
+    "桩已离线",
+    "设备离线",
+    "ReadTimeout",
+    "恢复上线",
+    "设备登录",
+    "设备重复登录",
+    "告警恢复：恢复上线",
+)
+_OFFLINE_FINISH_HINTS = (
+    "掉电",
+    "离线",
+    "断网",
+    "通信中断",
+    "重连",
+    "非正常停止(掉电)",
+)
+
 
 def looks_like_order_log(text: str) -> bool:
     if not text or len(text) < 80:
@@ -361,6 +380,98 @@ def _gun_status_sequence(
     return seq
 
 
+def _trouble_followed_by_charging(
+    gun_events: list[tuple[str, str, str]],
+    gun: str | None = None,
+) -> bool:
+    """本枪出现 TROUBLE 之后又进入 CHARGING（后续正常开充）则可忽略该 TROUBLE。"""
+    had_trouble = False
+    for _ts, g, st in gun_events:
+        if gun and gun not in (None, "", "-") and str(g) != str(gun):
+            continue
+        if st == "TROUBLE":
+            had_trouble = True
+        elif had_trouble and st == "CHARGING":
+            return True
+    return False
+
+
+def _ts_key(ts: str) -> str:
+    """时间戳排序键（取到秒或毫秒原文前缀，缺省排到最后）。"""
+    return (ts or "").strip()[:26] or "\uffff"
+
+
+def _first_idle_after_charging(
+    gun_events: list[tuple[str, str, str]],
+    gun: str | None,
+) -> str | None:
+    """本枪离开 CHARGING 后首次进入 IDLE（拔枪）的时间戳。"""
+    gun_s = str(gun) if gun not in (None, "", "-") else None
+    seen_charging = False
+    for ts, g, st in gun_events:
+        if gun_s and str(g) != gun_s:
+            continue
+        if st == "CHARGING":
+            seen_charging = True
+            continue
+        if seen_charging and st == "IDLE":
+            return ts or ""
+    return None
+
+
+def _clip_gun_events_after_unplug(
+    gun_events: list[tuple[str, str, str]],
+    gun: str | None,
+) -> list[tuple[str, str, str]]:
+    """充电结束并拔枪(IDLE)后，本枪后续状态变化不再归属本单。
+
+    保留拔枪当次 IDLE；其后的 TROUBLE / READY / 再开充等一律丢弃，
+    避免后一枪会话的故障/异常污染前一订单。
+    """
+    gun_s = str(gun) if gun not in (None, "", "-") else None
+    out: list[tuple[str, str, str]] = []
+    seen_charging = False
+    closed = False
+    for ts, g, st in gun_events:
+        if gun_s and str(g) != gun_s:
+            # 他枪事件仍保留，供「同桩其他枪」摘录
+            out.append((ts, g, st))
+            continue
+        if closed:
+            continue
+        out.append((ts, g, st))
+        if st == "CHARGING":
+            seen_charging = True
+        elif seen_charging and st == "IDLE":
+            closed = True
+    return out
+
+
+def _filter_notes_before_ts(notes: list[str], cutoff_ts: str | None) -> list[str]:
+    """丢弃时间戳晚于 cutoff（拔枪后）的异常摘录。无时间戳的保留。"""
+    if not cutoff_ts:
+        return notes
+    cut = _ts_key(cutoff_ts)
+    kept: list[str] = []
+    for note in notes:
+        m = _TS.match(note.strip())
+        if m and _ts_key(m.group(1)) > cut:
+            continue
+        kept.append(note)
+    return kept
+
+
+def _is_offline_finish(finish: str, finish_code: Any = None) -> bool:
+    """设备结束原因是否指向掉电/离线类。"""
+    if finish and any(h in finish for h in _OFFLINE_FINISH_HINTS):
+        return True
+    # 星星充电等：stopReason=60 且文案含非正常停止
+    code = str(finish_code).strip() if finish_code is not None else ""
+    if code == "60" and finish and ("非正常" in finish or "掉电" in finish or "离线" in finish):
+        return True
+    return False
+
+
 def _analyze_stop(
     *,
     has_remote_stop: bool,
@@ -369,24 +480,45 @@ def _analyze_stop(
     finish_code: Any,
     gun_events: list[tuple[str, str, str]],
     gun: str,
+    offline_reconnect: bool = False,
 ) -> dict[str, Any]:
-    """区分平台远程停止 / 设备跳枪 / 直接拔枪 / 枪口故障 / 疑似急停。"""
+    """区分平台远程停止 / 离线重连 / 设备跳枪 / 直接拔枪 / 枪口故障 / 疑似急停。"""
     finish = (finish_msg or "").strip() if finish_msg and finish_msg != "-" else ""
     platform_msg = (remote_stop_msg or "").strip() if remote_stop_msg else ""
     seq = _gun_status_sequence(gun_events, gun)
 
-    # 充电后的状态变迁
+    # 充电后的状态变迁（拔枪 IDLE 后会话结束，不再看后续枪口变化）
     after_charge: list[tuple[str, str]] = []
     seen_charging = False
+    session_closed = False
     for ts, st in seq:
+        if session_closed:
+            break
         if st == "CHARGING":
             seen_charging = True
             after_charge = []
             continue
         if seen_charging:
             after_charge.append((ts, st))
+            if st == "IDLE":
+                session_closed = True
 
-    trouble_idxs = [i for i, (_, st) in enumerate(seq) if st == "TROUBLE"]
+    # 会话边界：首次 CHARGING 起，至拔枪 IDLE（含）为止
+    first_charge_idx = next((i for i, (_, st) in enumerate(seq) if st == "CHARGING"), None)
+    session_end_idx = len(seq) - 1
+    if first_charge_idx is not None:
+        for i in range(first_charge_idx + 1, len(seq)):
+            if seq[i][1] == "IDLE":
+                session_end_idx = i
+                break
+    trouble_idxs = [
+        i
+        for i, (_, st) in enumerate(seq)
+        if st == "TROUBLE"
+        and (first_charge_idx is None or i >= first_charge_idx)
+        and i <= session_end_idx
+    ]
+
     brief_trouble = False
     persistent_trouble = False
     if trouble_idxs:
@@ -418,6 +550,40 @@ def _analyze_stop(
             "tip": "",
             "evidence": "日志中存在平台远程停止指令"
             + (f"；平台原因：{platform_msg}" if platform_msg else ""),
+        }
+
+    # 掉电/离线重连：优先于枪口 IDLE 误判为拔枪（重连后常直接报 IDLE）
+    # 若重连后才上报 TROUBLE：归为「离线上报枪口故障」，绝不能判人工急停
+    if offline_reconnect or _is_offline_finish(finish, finish_code):
+        post_offline_trouble = bool(trouble_idxs) or first_after == "TROUBLE" or any(
+            st == "TROUBLE" for _, st in after_charge
+        )
+        if post_offline_trouble:
+            return {
+                "category": "offline_gun_fault",
+                "stop_type": "离线上报枪口故障",
+                "reason": finish or "设备离线重连后上报枪口故障",
+                "platform_stop_reason": "-",
+                "device_finish_reason": finish or "-",
+                "gun_transition": (
+                    f"CHARGING→{first_after}" if first_after else "重连后 TROUBLE"
+                ),
+                "tip": "设备先离线，重连后才上报枪口故障（TROUBLE），属离线场景下的故障上报，非人工急停。",
+                "evidence": "日志先出现离线/超时/重连登录，随后枪口变为 TROUBLE"
+                + (f"；设备上报：{finish}" if finish else ""),
+            }
+        return {
+            "category": "offline_reconnect",
+            "stop_type": "设备离线重连结束",
+            "reason": finish or "设备离线后重连上报账单导致订单结束",
+            "platform_stop_reason": "-",
+            "device_finish_reason": finish or "-",
+            "gun_transition": (
+                f"CHARGING→{first_after}" if first_after else "离线后重连上报"
+            ),
+            "tip": "订单因设备掉电/离线后重新登录并上报充电记录而结束，非用户主动拔枪。",
+            "evidence": "日志出现离线/恢复上线/重复登录，或设备结束原因为掉电类"
+            + (f"；设备上报：{finish}" if finish else ""),
         }
 
     # 无远程停止 → 设备侧结束
@@ -788,8 +954,345 @@ def _fmt_tou_brief(tou: dict[str, float], scale: int = 1000) -> str:
     return "、".join(parts) if parts else "无分时电量"
 
 
-# 过程与账单电量差 < 1 kWh 视为可忽略（比较前先按 accuracyFlag 换算）
+_TOU_KEYS = ("尖", "峰", "平", "谷")
+# 原始整数电量允许 1 个最小计量单位抖动（千分位下约 0.001 kWh）
+_ENERGY_SERIES_EPS = 1.0
+
+
+def _check_process_energy_series(
+    chgs: list[dict[str, Any]],
+    *,
+    scale: int = 1000,
+) -> list[dict[str, Any]]:
+    """过程帧总电量/分时电量应逐步递增；出现回落则异常。"""
+    checks: list[dict[str, Any]] = []
+    if len(chgs) < 2:
+        checks.append(
+            {
+                "ok": True,
+                "code": "SERIES_SKIP",
+                "message": "过程帧不足 2 条，未做电量递增校验。",
+            }
+        )
+        return checks
+
+    prev_total: float | None = None
+    prev_tou: dict[str, float] | None = None
+    issues: list[str] = []
+    for i, fr in enumerate(chgs):
+        if not isinstance(fr, dict):
+            continue
+        total_raw = fr.get("totalBattery")
+        try:
+            total = float(total_raw) if total_raw is not None else None
+        except (TypeError, ValueError):
+            total = None
+        tou = _tou_map(fr)
+        if prev_total is not None and total is not None:
+            if total + _ENERGY_SERIES_EPS < prev_total:
+                issues.append(
+                    f"第{i + 1}帧总电量回落："
+                    f"{_fmt_kwh(prev_total, scale)} → {_fmt_kwh(total, scale)}"
+                )
+        if prev_tou is not None:
+            for k in _TOU_KEYS:
+                if tou[k] + _ENERGY_SERIES_EPS < prev_tou[k]:
+                    issues.append(
+                        f"第{i + 1}帧分时“{k}”回落："
+                        f"{_fmt_kwh(prev_tou[k], scale)} → {_fmt_kwh(tou[k], scale)}"
+                    )
+        if total is not None:
+            prev_total = total
+        prev_tou = tou
+
+    if issues:
+        # 最多列 3 条，避免刷屏
+        detail = "；".join(issues[:3])
+        if len(issues) > 3:
+            detail += f"等共 {len(issues)} 处"
+        checks.append(
+            {
+                "ok": False,
+                "code": "ENERGY_DECREASE",
+                "message": f"充电过程电量未单调递增：{detail}",
+            }
+        )
+    else:
+        checks.append(
+            {
+                "ok": True,
+                "code": "SERIES_OK",
+                "message": f"过程总电量与分时电量均逐步递增（共 {len(chgs)} 帧）。",
+            }
+        )
+    return checks
+
+
+def _check_inactive_tou_frozen(
+    chgs: list[dict[str, Any]],
+    *,
+    scale: int = 1000,
+) -> list[dict[str, Any]]:
+    """非当前增长时段的分时电量应保持不变；已锁定时段再变动则异常。
+
+    判定：当总电量仍在增加时，某分时段本帧未增长则锁定；之后该段再增/减均告警。
+    """
+    checks: list[dict[str, Any]] = []
+    if len(chgs) < 2:
+        checks.append(
+            {
+                "ok": True,
+                "code": "TOU_FREEZE_SKIP",
+                "message": "过程帧不足 2 条，未做非当前时段分时固化校验。",
+            }
+        )
+        return checks
+
+    locked: set[str] = set()
+    prev_tou: dict[str, float] | None = None
+    prev_total: float | None = None
+    issues: list[str] = []
+
+    for i, fr in enumerate(chgs):
+        if not isinstance(fr, dict):
+            continue
+        tou = _tou_map(fr)
+        try:
+            total = float(fr.get("totalBattery") or 0)
+        except (TypeError, ValueError):
+            total = 0.0
+
+        if prev_tou is not None:
+            deltas = {k: tou[k] - prev_tou[k] for k in _TOU_KEYS}
+            total_up = prev_total is not None and total > prev_total + _ENERGY_SERIES_EPS
+            growing = {k for k, d in deltas.items() if d > _ENERGY_SERIES_EPS}
+
+            for k in locked:
+                d = deltas[k]
+                if abs(d) > _ENERGY_SERIES_EPS:
+                    direction = "增长" if d > 0 else "回落"
+                    issues.append(
+                        f"第{i + 1}帧非当前时段“{k}”不应再变动（{direction}："
+                        f"{_fmt_kwh(prev_tou[k], scale)} → {_fmt_kwh(tou[k], scale)}）"
+                    )
+
+            # 总电量在涨时：未增长且已有电量的时段视为离开所属时段，予以锁定
+            if total_up:
+                for k in _TOU_KEYS:
+                    if k in growing:
+                        continue
+                    if prev_tou[k] > _ENERGY_SERIES_EPS:
+                        locked.add(k)
+
+        prev_tou = tou
+        prev_total = total
+
+    if issues:
+        detail = "；".join(issues[:3])
+        if len(issues) > 3:
+            detail += f"等共 {len(issues)} 处"
+        checks.append(
+            {
+                "ok": False,
+                "code": "TOU_INACTIVE_CHANGED",
+                "message": f"非所属时段分时电量发生变动：{detail}",
+            }
+        )
+    else:
+        checks.append(
+            {
+                "ok": True,
+                "code": "TOU_FREEZE_OK",
+                "message": "非当前所属时段的分时电量保持不变。",
+            }
+        )
+    return checks
+
+
+def _check_start_success(
+    *,
+    start_ok: bool,
+    is_card_start: bool,
+    is_vin_start: bool,
+    is_remote_start: bool,
+    has_remote_cmd: bool,
+    gun_events: list[tuple[str, str, str]],
+    gun: str | None,
+    socs: list[dict[str, Any]],
+    chgs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """启动是否成功：启动响应 + 枪口进入 CHARGING + 有电流/电压/电量过程数据。"""
+    evidence: list[str] = []
+    problems: list[str] = []
+
+    # 1) 启动响应 / 鉴权成功
+    if start_ok or is_card_start or is_vin_start or is_remote_start or has_remote_cmd:
+        if is_card_start:
+            evidence.append("刷卡/卡鉴权成功")
+        elif is_vin_start:
+            evidence.append("VIN 鉴权成功")
+        elif is_remote_start or has_remote_cmd or start_ok:
+            evidence.append("启动响应成功或远程启动指令已下发")
+    else:
+        problems.append("未找到启动成功响应（启动充电响应/鉴权成功等）")
+
+    # 2) 枪口进入 CHARGING
+    gun_s = str(gun) if gun not in (None, "", "-") else None
+    charging_hits = [
+        (ts, g, st)
+        for ts, g, st in gun_events
+        if st == "CHARGING" and (not gun_s or str(g) == gun_s)
+    ]
+    if charging_hits:
+        ts0 = charging_hits[0][0] or ""
+        evidence.append(
+            f"{charging_hits[0][1]}枪进入 CHARGING"
+            + (f"（{_cn_datetime(ts0) if ts0 else ts0}）" if ts0 else "")
+        )
+    else:
+        problems.append("枪口状态未观察到 CHARGING")
+
+    # 3) 过程电气量 / 电量
+    def _has_pos(obj: dict[str, Any], *keys: str) -> bool:
+        for k in keys:
+            v = obj.get(k)
+            try:
+                if v not in (None, "", 0, "0") and float(v) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    has_vi = any(
+        _has_pos(
+            s,
+            "batteryChargerOutputCurrent",
+            "batteryChargerOutputVoltage",
+            "outputCurrent",
+            "outputVoltage",
+        )
+        for s in socs
+        if isinstance(s, dict)
+    )
+    has_energy = any(
+        _has_pos(c, "totalBattery") for c in chgs if isinstance(c, dict)
+    )
+    if has_vi:
+        evidence.append("有电流/电压过程上报")
+    else:
+        problems.append("无电流/电压过程数据")
+    if has_energy:
+        evidence.append("有电量过程上报")
+    else:
+        # 极短单可能尚无电量，有 V/I 时降为提示但不单独判失败？用户要求看电量，缺则记问题
+        problems.append("无电量过程数据（chargingInfo.totalBattery）")
+
+    ok = not problems
+    if ok:
+        msg = "启动成功：" + "；".join(evidence)
+        code = "START_OK"
+    else:
+        msg = "启动校验异常：" + "；".join(problems)
+        if evidence:
+            msg += "。已具备：" + "；".join(evidence)
+        code = "START_FAIL"
+    return {"ok": ok, "code": code, "message": msg, "evidence": evidence, "problems": problems}
+
+
+# 过程与账单电量：基础容差 1 kWh；高功率按末帧功率×滞后窗口放大
 _ENERGY_TOL_KWH = 1.0
+_ENERGY_TOL_LAG_MINUTES = 2.0
+
+
+def _estimate_power_kw(*frames: dict[str, Any] | None) -> float | None:
+    """从 socInfo / chargingInfo 估算输出功率（kW）。优先 OutPower，否则 I×U。"""
+    for obj in frames:
+        if not isinstance(obj, dict):
+            continue
+        p_raw = obj.get("batteryChargerOutPower")
+        try:
+            if p_raw not in (None, "", 0, "0"):
+                p = float(p_raw)
+                if p > 0:
+                    # 与报告电气统计一致：千分位千瓦（122500 → 122.5）
+                    return p / 1000.0 if p >= 100 else p
+        except (TypeError, ValueError):
+            pass
+        i_raw = obj.get("batteryChargerOutputCurrent")
+        u_raw = obj.get("batteryChargerOutputVoltage")
+        if i_raw in (None, "", 0, "0") or u_raw in (None, "", 0, "0"):
+            # 星星过程帧偶见 outputCurrent/Voltage（百分位电流、十分位电压）
+            i_raw = obj.get("outputCurrent")
+            u_raw = obj.get("outputVoltage")
+            try:
+                if i_raw not in (None, "", 0, "0") and u_raw not in (None, "", 0, "0"):
+                    i_f, u_f = float(i_raw), float(u_raw)
+                    if i_f > 0 and u_f > 0:
+                        # 22998×5327 → 先按百分位/十分位：I/100 * U/10 / 1000 = kW
+                        if i_f > 1000 or u_f > 1000:
+                            return (i_f / 100.0) * (u_f / 10.0) / 1000.0
+                        return i_f * u_f / 1000.0
+            except (TypeError, ValueError):
+                pass
+            continue
+        try:
+            i_f, u_f = float(i_raw), float(u_raw)
+        except (TypeError, ValueError):
+            continue
+        if i_f > 0 and u_f > 0:
+            # socInfo 千分位：I*U/1e6 → 千分位千瓦，再 /1000 → kW
+            return (i_f * u_f) / 1_000_000.0 / 1000.0 if i_f >= 1000 else (i_f * u_f) / 1000.0
+    return None
+
+
+def _energy_tol_kwh(power_kw: float | None) -> tuple[float, str]:
+    """总电量容差：基础 1 kWh；大功率按末帧功率×约 2 分钟滞后放大。"""
+    base = _ENERGY_TOL_KWH
+    if power_kw is None or power_kw <= 0:
+        return base, f"{base:g} kwh"
+    dyn = float(power_kw) * _ENERGY_TOL_LAG_MINUTES / 60.0
+    tol = max(base, dyn)
+    if tol > base + 1e-9:
+        return (
+            tol,
+            f"{tol:.3f} kwh（末帧功率约 {power_kw:.1f} kW，允许约 {_ENERGY_TOL_LAG_MINUTES:g} 分钟滞后）",
+        )
+    return base, f"{base:g} kwh"
+
+
+def _pick_bill_energy_src(
+    record: dict[str, Any] | None,
+    bill: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """结算电量优先用 recordInfo；原始上报账单常无 totalBattery。"""
+    if isinstance(record, dict) and record.get("totalBattery") is not None:
+        return record
+    if isinstance(bill, dict) and bill.get("totalBattery") is not None:
+        return bill
+    # 原始 CHARGE_RECORD：用 periodInfos.battery 汇总（星星等常比结算多一位）
+    if isinstance(bill, dict):
+        periods = bill.get("periodInfos")
+        if isinstance(periods, list) and periods:
+            try:
+                raw = sum(float(p.get("battery") or 0) for p in periods if isinstance(p, dict))
+            except (TypeError, ValueError):
+                raw = 0.0
+            if raw > 0:
+                synth = dict(bill)
+                synth["totalBattery"] = raw / 10.0 if raw >= 10000 else raw
+                return synth
+    return record or bill
+
+
+def _pick_proc_frame(
+    chgs: list[dict[str, Any]],
+    bill_src: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """过程帧取本单最后一条 chargingInfo，与账单做电量对比。"""
+    if not chgs:
+        return None
+    # 日志按时间顺序收集，末帧即最后一次过程上报
+    return chgs[-1]
 
 
 def _check_process_vs_bill(
@@ -799,10 +1302,12 @@ def _check_process_vs_bill(
     end_meter: Any,
     *,
     meter_scale: int | None = None,
+    last_power_kw: float | None = None,
 ) -> list[dict[str, Any]]:
     """过程 chargingInfo 与账单/结算电量、分时交叉校验。
 
     各侧按自身 accuracyFlag 换算为 kWh 后再比较（蔚景账单常见 accuracyFlag=4 万分位）。
+    总电量容差默认 1 kWh；若末帧为大功率，按功率×约 2 分钟滞后放大。
     """
     checks: list[dict[str, Any]] = []
     if not proc and not bill_src:
@@ -817,6 +1322,9 @@ def _check_process_vs_bill(
     proc_scale = _accuracy_scale(proc, 1000)
     bill_scale = _accuracy_scale(bill_src, 1000)
     m_scale = meter_scale if meter_scale is not None else bill_scale
+    if last_power_kw is None:
+        last_power_kw = _estimate_power_kw(proc)
+    tol_kwh, tol_desc = _energy_tol_kwh(last_power_kw)
 
     proc_raw = float((proc or {}).get("totalBattery") or 0) if proc else None
     bill_raw = float((bill_src or {}).get("totalBattery") or 0) if bill_src else None
@@ -834,17 +1342,21 @@ def _check_process_vs_bill(
             return "-"
         return _fmt_kwh(v * 1000, 1000)  # 已是 kWh，借千分位格式化
 
-    # 1) 总电量：过程 vs 账单
+    # 1) 总电量：过程 vs 账单（容差随末帧功率动态调整）
     if proc_total is not None and bill_total is not None and (proc_total > 0 or bill_total > 0):
         diff = abs(proc_total - bill_total)
-        if diff < _ENERGY_TOL_KWH:
+        if diff < tol_kwh:
             checks.append(
                 {
                     "ok": True,
                     "code": "TOTAL_OK",
                     "message": (
                         f"总电量一致：过程 {_fk(proc_total)}，账单 {_fk(bill_total)}"
-                        + (f"（差值 {_fk(diff)}，可忽略）" if diff > 0 else "")
+                        + (
+                            f"（差值 {_fk(diff)}，容差 {tol_desc}，可忽略）"
+                            if diff > 0
+                            else ""
+                        )
                         + "。"
                     ),
                 }
@@ -856,12 +1368,12 @@ def _check_process_vs_bill(
                     "code": "TOTAL_MISMATCH",
                     "message": (
                         f"总电量不一致：过程 {_fk(proc_total)}，账单 {_fk(bill_total)}，"
-                        f"相差 {_fk(diff)}（超过 1 kwh 容差）。"
+                        f"相差 {_fk(diff)}（超过容差 {tol_desc}）。"
                     ),
                 }
             )
 
-    # 2) 表计差额 vs 账单总电量
+    # 2) 表计差额 vs 账单总电量（结算自洽，仍用基础 1 kWh）
     if meter_delta is not None and bill_total is not None and bill_total > 0:
         diff = abs(meter_delta - bill_total)
         if diff < _ENERGY_TOL_KWH:
@@ -943,9 +1455,9 @@ def _check_process_vs_bill(
                 )
                 continue
             diff = abs(pv - bv)
-            if diff < _ENERGY_TOL_KWH:
+            if diff < tol_kwh:
                 continue
-            if (pv < _ENERGY_TOL_KWH) != (bv < _ENERGY_TOL_KWH) or diff >= _ENERGY_TOL_KWH:
+            if (pv < _ENERGY_TOL_KWH) != (bv < _ENERGY_TOL_KWH) or diff >= tol_kwh:
                 if (pv < _ENERGY_TOL_KWH and bv >= _ENERGY_TOL_KWH) or (
                     bv < _ENERGY_TOL_KWH and pv >= _ENERGY_TOL_KWH
                 ):
@@ -965,7 +1477,8 @@ def _check_process_vs_bill(
                             "code": "TOU_AMOUNT_MISMATCH",
                             "message": (
                                 f"分时“{name}”段电量差异较大：过程 {_fk(pv)}，"
-                                f"账单 {_fk(bv)}，相差 {_fk(diff)}。"
+                                f"账单 {_fk(bv)}，相差 {_fk(diff)}"
+                                f"（超过容差 {tol_desc}）。"
                             ),
                         }
                     )
@@ -1029,6 +1542,8 @@ def analyze_order_log(
     vin_auth = False
     offline = False
     fault = False
+    fault_notes: list[str] = []
+    other_gun_notes: list[str] = []
     matched_guns: set[str] = set()
     matched_trade_nos: set[str] = set()
 
@@ -1144,18 +1659,37 @@ def analyze_order_log(
             if vm and _has_real_vin(vm.group(1)):
                 vin_auth = True
                 start_ok = True
-        if ("桩已离线" in ln or "ReadTimeout" in ln) and (not sid or related):
+        if any(m in ln for m in _OFFLINE_LOG_MARKERS):
+            # 离线/超时/登录为桩级事件，行内常无 serviceId，仍作为本单离线背景
             offline = True
         if "故障" in ln and "枪" in ln and related:
-            fault = True
+            # 尽量绑定本单枪口；无法识别枪号时仍记入本单异常摘录
+            gm_fault = _GUN_STATUS.search(ln) or re.search(r"(\d+)\s*枪", ln)
+            gun_hit = gm_fault.group(1) if gm_fault else ""
+            if (not matched_guns) or (not gun_hit) or (gun_hit in matched_guns):
+                fault = True
+                ts = ts_m.group(1) if (ts_m := _TS.match(ln.strip())) else ""
+                snippet = ln.strip()
+                if len(snippet) > 120:
+                    snippet = snippet[:120] + "…"
+                fault_notes.append(f"{ts + '　' if ts else ''}{snippet}")
         gm = _GUN_STATUS.search(ln)
         ts_m = _TS.match(ln.strip())
         if gm:
             gun_no = gm.group(1)
-            if (not sid) or (not matched_guns) or (gun_no in matched_guns):
-                gun_events.append((ts_m.group(1) if ts_m else "", gun_no, gm.group(2)))
-                if gm.group(2) == "TROUBLE":
-                    fault = True
+            st = gm.group(2)
+            # 仅收录本单已匹配枪口，避免同桩其他枪 TROUBLE 污染本单
+            gun_ok = (not matched_guns) or (gun_no in matched_guns)
+            if gun_ok:
+                gun_events.append((ts_m.group(1) if ts_m else "", gun_no, st))
+                if st == "TROUBLE":
+                    # 稍后若本枪又进入 CHARGING，则忽略该 TROUBLE
+                    pass
+            elif st == "TROUBLE":
+                ts = ts_m.group(1) if ts_m else ""
+                note = f"{ts + '　' if ts else ''}同桩{gun_no}枪 TROUBLE（非本单枪口）"
+                if note not in other_gun_notes:
+                    other_gun_notes.append(note)
 
     # 指定了 serviceId 但没有任何业务 JSON 命中
     if sid and not (remote or start_frame or record or bill or socs or chgs):
@@ -1352,16 +1886,29 @@ def analyze_order_log(
         tou_scale = _accuracy_scale(bill, 1000)
     jian_p, feng_p, ping_p, gu_p = src.get("jianPrice"), src.get("fengPrice"), src.get("pingPrice"), src.get("guPrice")
 
-    # 过程帧：取本单 chargingInfo 中累计电量最大的一帧（接近结束）
-    proc_frame = None
-    if chgs:
-        proc_frame = max(chgs, key=lambda x: float(x.get("totalBattery") or 0))
-    bill_src = bill or record
+    # 过程帧：优先对齐账单结束表码；账单电量优先 recordInfo
+    bill_src = _pick_bill_energy_src(
+        record if isinstance(record, dict) else None,
+        bill if isinstance(bill, dict) else None,
+    )
+    proc_frame = _pick_proc_frame(chgs, bill_src if isinstance(bill_src, dict) else None)
     bill_scale = _accuracy_scale(bill_src if isinstance(bill_src, dict) else None, 1000)
     proc_scale = _accuracy_scale(proc_frame, 1000)
-    energy_checks = _check_process_vs_bill(
-        proc_frame, bill_src, start_meter, end_meter, meter_scale=meter_scale
+    last_power_kw = _estimate_power_kw(
+        proc_frame,
+        socs[-1] if socs else None,
     )
+    energy_checks = _check_process_vs_bill(
+        proc_frame,
+        bill_src,
+        start_meter,
+        end_meter,
+        meter_scale=meter_scale,
+        last_power_kw=last_power_kw,
+    )
+    series_checks = _check_process_energy_series(chgs, scale=proc_scale)
+    tou_freeze_checks = _check_inactive_tou_frozen(chgs, scale=proc_scale)
+    energy_checks = list(energy_checks) + list(series_checks) + list(tou_freeze_checks)
     energy_mismatch = any(not c.get("ok", True) for c in energy_checks)
     charge_money = src.get("chargeMoney") or src.get("serverChargeMoney")
     service_money = src.get("serviceMoney") or src.get("serverServiceMoney")
@@ -1388,9 +1935,32 @@ def analyze_order_log(
     if not remote_stop_msg and remote_stop:
         remote_stop_msg = _extract_stop_reason_msg(remote_stop)
 
+    # 掉电结束原因也视为离线场景
+    if _is_offline_finish(
+        "" if finish_msg == "-" else str(finish_msg or ""),
+        finish_code,
+    ):
+        offline = True
+
     # 账单 startWay 并入 src 供启动方式识别
     if isinstance(src, dict) and src.get("startWay") is None and isinstance(bill, dict) and bill.get("startWay") is not None:
         src = {**src, "startWay": bill.get("startWay"), "carvin": src.get("carvin") or bill.get("carvin")}
+
+    # 充电结束拔枪后：本枪后续状态/故障/异常与本单脱钩
+    unplug_ts = _first_idle_after_charging(gun_events, gun)
+    gun_events = _clip_gun_events_after_unplug(gun_events, gun)
+    fault_notes = _filter_notes_before_ts(fault_notes, unplug_ts)
+    for ts, gun_no, st in gun_events:
+        if st != "TROUBLE":
+            continue
+        if gun not in (None, "", "-") and str(gun_no) != str(gun):
+            continue
+        if _trouble_followed_by_charging(gun_events, gun_no):
+            continue
+        note = f"{ts + '　' if ts else ''}{gun_no}枪状态变为 TROUBLE"
+        if note not in fault_notes:
+            fault_notes.append(note)
+    fault = bool(fault_notes)
 
     stop_info = _analyze_stop(
         has_remote_stop=has_remote_stop,
@@ -1399,6 +1969,7 @@ def analyze_order_log(
         finish_code=finish_code,
         gun_events=gun_events,
         gun=gun,
+        offline_reconnect=offline,
     )
     # 急停/故障类在结论里需要提示确认
     need_user_confirm = stop_info["category"] in {"estop_suspect", "gun_fault"}
@@ -1480,6 +2051,18 @@ def analyze_order_log(
     is_card_start = start_way.startswith("刷卡")
     is_vin_start = start_way.startswith("VIN")
     is_remote_start = start_way.startswith("远程")
+    start_check = _check_start_success(
+        start_ok=start_ok,
+        is_card_start=is_card_start,
+        is_vin_start=is_vin_start,
+        is_remote_start=is_remote_start,
+        has_remote_cmd=bool(remote),
+        gun_events=gun_events,
+        gun=gun,
+        socs=socs,
+        chgs=chgs,
+    )
+    start_mismatch = not start_check.get("ok", True)
 
     out: list[str] = [
         "充电订单分析报告",
@@ -1592,8 +2175,11 @@ def analyze_order_log(
     out += _section("四、过程与账单校验")
     out.append(
         "说明：对比 chargingInfo（过程）与 recordInfo/账单（结算）；"
-        "各侧按 accuracyFlag 换算（缺省千分位，蔚景账单常见万分位）；差值小于 1 kwh 视为可忽略。"
+        "并校验过程总电量/分时是否逐步递增、非所属时段分时是否固化；"
+        "各侧按 accuracyFlag 换算（缺省千分位，蔚景账单常见万分位）；"
+        "基础容差 1 kwh，末帧为大功率时按功率×约 2 分钟滞后放大容差。"
     )
+    out.append(f"启动校验：{start_check.get('message')}")
     out.append(
         f"过程电量快照：总 {_fmt_kwh((proc_frame or {}).get('totalBattery'), proc_scale)}，"
         f"{_fmt_tou_brief(_tou_map(proc_frame), proc_scale)}。"
@@ -1614,10 +2200,15 @@ def analyze_order_log(
     for i, ck in enumerate(energy_checks, 1):
         mark = "通过" if ck.get("ok") else "异常"
         out.append(f"{i}. [{mark}] {ck.get('message')}")
-    if energy_mismatch:
-        out.append("结论：过程数据与账单存在不一致，请复核分时归属与电量归集。")
+    if energy_mismatch or start_mismatch:
+        bits = []
+        if start_mismatch:
+            bits.append("启动校验未通过")
+        if energy_mismatch:
+            bits.append("过程电量序列/账单交叉校验存在异常")
+        out.append("结论：" + "；".join(bits) + "，请复核。")
     else:
-        out.append("结论：过程与账单电量/分时在容差内一致。")
+        out.append("结论：启动校验通过；过程电量递增与非所属时段固化正常；过程与账单电量/分时在容差内一致。")
 
     out += _section("五、费用明细")
     out += [
@@ -1662,8 +2253,19 @@ def analyze_order_log(
         f"占桩时长：{occupy_dur}",
         f"占桩费用：{_fmt_money(parking_money, money_scale) if parking_money else '0 元'}",
     ]
+    if fault_notes:
+        out.append("本单异常/告警摘录：" + "；".join(fault_notes[:5]) + "。")
+    else:
+        out.append("本单异常/告警摘录：无（本单枪口未见 TROUBLE/故障告警）。")
+    if other_gun_notes:
+        out.append("同桩其他枪口提示（非本单）：" + "；".join(other_gun_notes[:3]) + "。")
     if stop_info.get("tip"):
         out.append(f"提示：{stop_info['tip']}")
+    if finish_msg and str(finish_msg).startswith("结束代码 ") and not fault_notes:
+        out.append(
+            f"说明：设备仅上报停止码 {finish_code}，日志中无对应中文原因；"
+            "请结合厂商停止码表核对（不等于平台判定的电气异常）。"
+        )
 
     out += _section("七、过程简述")
     steps: list[str] = []
@@ -1689,6 +2291,26 @@ def analyze_order_log(
                 f"{n}. {_cn_datetime(end_time)}　平台下发远程停止"
                 + (f"（{stop_info['reason']}）" if stop_info.get("reason") and stop_info["reason"] != "-" else "")
                 + "并完成结算。"
+            )
+        elif stop_info["category"] == "offline_gun_fault":
+            steps.append(
+                f"{n}. {_cn_datetime(end_time)}　设备离线重连后上报枪口故障并结单"
+                + (
+                    f"，设备上报“{stop_info['device_finish_reason']}”。"
+                    if stop_info.get("device_finish_reason")
+                    and stop_info["device_finish_reason"] != "-"
+                    else "。"
+                )
+            )
+        elif stop_info["category"] == "offline_reconnect":
+            steps.append(
+                f"{n}. {_cn_datetime(end_time)}　设备离线重连后上报账单结束订单"
+                + (
+                    f"，设备上报“{stop_info['device_finish_reason']}”。"
+                    if stop_info.get("device_finish_reason")
+                    and stop_info["device_finish_reason"] != "-"
+                    else "。"
+                )
             )
         elif stop_info["category"] in {"device_unplug", "device_occupy", "device_idle_unplug"}:
             steps.append(
@@ -1722,44 +2344,48 @@ def analyze_order_log(
     normal = bool(total_batt or socs) and not (stop_info["category"] in {"gun_fault"})
     if need_user_confirm:
         out.append(f"本订单停止类型为「{stop_info['stop_type']}」，需现场确认。")
-    elif normal and not has_remote_stop and not energy_mismatch and stop_info["category"] in {
+    elif normal and not has_remote_stop and not energy_mismatch and not start_mismatch and stop_info["category"] in {
         "device_finish",
         "device_unplug",
         "device_occupy",
         "device_idle_unplug",
+        "offline_reconnect",
+        "offline_gun_fault",
     }:
         out.append(f"本订单为「{stop_info['stop_type']}」结束的充电订单。")
-    elif energy_mismatch:
-        out.append("本订单已提取完毕，但过程数据与账单校验存在差异，需重点复核。")
+    elif energy_mismatch or start_mismatch:
+        out.append("本订单已提取完毕，但启动或过程电量校验存在差异，需重点复核。")
     elif has_remote_stop:
         out.append("本订单为平台远程停止结束的充电订单。")
     else:
         out.append("本订单充电数据已提取完毕，请结合下列要点复核。")
     out.append("")
     bullets = []
-    if is_card_start:
+    if start_mismatch:
+        bullets.append(f"1. {start_check.get('message')}")
+    elif is_card_start:
         bullets.append(
-            "1. 刷卡启动成功，充电过程电流、电压、功率稳定，表计电量与功率、时长基本自洽。"
-            if currents
-            else "1. 刷卡启动成功，并完成结算数据上报。"
+            "1. 刷卡启动成功，枪口已进入充电，过程有电流/电压/电量上报。"
+            if start_check.get("ok")
+            else f"1. {start_check.get('message')}"
         )
     elif is_vin_start:
         bullets.append(
-            "1. VIN 鉴权启动成功，充电过程电流、电压、功率稳定，表计电量与功率、时长基本自洽。"
-            if currents
-            else "1. VIN 鉴权启动成功，并完成结算数据上报。"
+            "1. VIN 鉴权启动成功，枪口已进入充电，过程有电流/电压/电量上报。"
+            if start_check.get("ok")
+            else f"1. {start_check.get('message')}"
         )
     elif is_remote_start or remote or start_ok:
         bullets.append(
-            "1. 远程启动成功，充电过程电流、电压、功率稳定，表计电量与功率、时长基本自洽。"
-            if currents
-            else "1. 远程启动成功，并完成结算数据上报。"
+            "1. 远程启动成功，枪口已进入充电，过程有电流/电压/电量上报。"
+            if start_check.get("ok")
+            else f"1. {start_check.get('message')}"
         )
     else:
-        bullets.append("1. 已提取启动与结算相关字段。")
+        bullets.append(f"1. {start_check.get('message')}")
     if energy_mismatch:
         bad = [c["message"] for c in energy_checks if not c.get("ok")]
-        bullets.append("2. 过程与账单校验异常：" + ("；".join(bad[:2]) if bad else "电量或分时不一致。"))
+        bullets.append("2. 过程电量/账单校验异常：" + ("；".join(bad[:3]) if bad else "电量或分时不一致。"))
     elif has_remote_stop:
         msg = f"2. 平台下发远程停止，停止原因：{stop_info['reason']}。"
         if offline:
@@ -1769,6 +2395,16 @@ def analyze_order_log(
         bullets.append("2. 枪口曾短暂 TROUBLE 后恢复，疑似用户按下急停，请向现场确认。")
     elif stop_info["category"] == "gun_fault":
         bullets.append("2. 枪口进入 TROUBLE 并持续异常，判定为枪口故障停止。")
+    elif stop_info["category"] == "offline_gun_fault":
+        bullets.append(
+            f"2. 无平台远程停止；先离线，重连后上报枪口故障，设备原因：{stop_info['device_finish_reason']}。"
+            "属离线上报故障，非人工急停。需到设备上核实充电数据，请设备方协助排查。"
+        )
+    elif stop_info["category"] == "offline_reconnect":
+        bullets.append(
+            f"2. 无平台远程停止；设备离线重连导致订单结束，设备原因：{stop_info['device_finish_reason']}。"
+            "需到设备上核实充电数据，请设备方协助排查。"
+        )
     elif stop_info["category"] in {"device_unplug", "device_occupy", "device_idle_unplug"}:
         msg = (
             f"2. 无平台远程停止；{stop_info['stop_type']}，设备原因：{stop_info['device_finish_reason']}。"
@@ -1781,7 +2417,8 @@ def analyze_order_log(
     elif not fault:
         bullets.append("2. 充电期间无离线、无故障、无告警，也无平台远程停止指令。")
     else:
-        bullets.append("2. 日志中存在异常相关记录，建议人工复核。")
+        detail = "；".join(fault_notes[:3]) if fault_notes else "存在故障/告警关键字"
+        bullets.append(f"2. 日志异常：{detail}。建议人工复核。")
     if stop_info.get("reason") and stop_info["reason"] != "-":
         fee_txt = (
             _fmt_money((charge_money or 0) + (service_money or 0) + (parking_money or 0), money_scale)
@@ -1807,21 +2444,35 @@ def analyze_order_log(
         else:
             bullets.append(f"5. 分时电量以结算字段为准；实际充电量以表计 {total_kwh:.3f} kwh 为准。")
     if energy_mismatch:
-        bullets.append("6. 过程与账单校验：发现不一致，详见“四、过程与账单校验”。")
+        bullets.append("6. 过程电量/账单校验：发现不一致，详见“四、过程与账单校验”。")
+    if start_mismatch:
+        bullets.append(f"{len(bullets) + 1}. 启动校验未通过，详见启动校验说明。")
     if need_user_confirm and stop_info.get("tip"):
-        bullets.append(f"7. {stop_info['tip']}")
+        bullets.append(f"{len(bullets) + 1}. {stop_info['tip']}")
     if offline and not any("需到设备上核实充电数据" in b for b in bullets):
         bullets.append(
             f"{len(bullets) + 1}. 过程中曾出现离线，需到设备上核实充电数据，请设备方协助排查。"
         )
+    if other_gun_notes and stop_info["category"] not in {"gun_fault", "estop_suspect"}:
+        bullets.append(
+            f"{len(bullets) + 1}. 同桩其他枪口提示（与本单无关）："
+            + "；".join(other_gun_notes[:2])
+            + "。"
+        )
     out.extend(bullets)
     out.append("")
-    if energy_mismatch:
-        out.append("综合判断：过程与账单电量/分时不一致，请复核后再确认结算。")
+    if energy_mismatch or start_mismatch:
+        reasons = []
+        if start_mismatch:
+            reasons.append("启动校验未通过")
+        if energy_mismatch:
+            reasons.append("过程电量递增/分时固化或账单交叉校验异常")
+        reason_txt = "、".join(reasons)
+        out.append(f"综合判断：{reason_txt}，请复核后再确认结算。")
         out.append("需到设备上核实相关数据，请设备方协助排查。")
         valid = False
         verdict = (
-            "综合判断：过程与账单电量/分时不一致，请复核后再确认结算。\n"
+            f"综合判断：{reason_txt}，请复核后再确认结算。\n"
             "需到设备上核实相关数据，请设备方协助排查。"
         )
     elif need_user_confirm:
@@ -1833,13 +2484,24 @@ def analyze_order_log(
             "需到设备上核实相关数据，请设备方协助排查。"
         )
     elif offline:
-        out.append("综合判断：充电过程中出现离线，需到设备上核实充电数据后再确认。")
+        if stop_info["category"] == "offline_gun_fault":
+            out.append(
+                "综合判断：离线上报枪口故障（先离线、重连后报 TROUBLE），非人工急停；"
+                "需到设备上核实充电数据后再确认。"
+            )
+            verdict = (
+                "综合判断：离线上报枪口故障（先离线、重连后报 TROUBLE），非人工急停；"
+                "需到设备上核实充电数据后再确认。\n"
+                "需到设备上核实相关数据，请设备方协助排查。"
+            )
+        else:
+            out.append("综合判断：充电过程中出现离线，需到设备上核实充电数据后再确认。")
+            verdict = (
+                "综合判断：充电过程中出现离线，需到设备上核实充电数据后再确认。\n"
+                "需到设备上核实相关数据，请设备方协助排查。"
+            )
         out.append("需到设备上核实相关数据，请设备方协助排查。")
         valid = False
-        verdict = (
-            "综合判断：充电过程中出现离线，需到设备上核实充电数据后再确认。\n"
-            "需到设备上核实相关数据，请设备方协助排查。"
-        )
     elif has_remote_stop:
         out.append("综合判断：平台远程停止流程完整，结算数据可核对。")
         valid = True
@@ -1911,6 +2573,14 @@ def analyze_order_log(
             "name": "过程与账单校验",
             "value": "异常" if energy_mismatch else "通过",
         },
+        {
+            "name": "启动校验",
+            "value": "通过" if start_check.get("ok") else "异常",
+        },
+        {
+            "name": "启动校验说明",
+            "value": start_check.get("message") or "-",
+        },
         {"name": "电池荷电状态", "value": "未上报（全程为 0）" if not soc_nonzero else "有上报"},
         {"name": "车辆识别码", "value": vin},
         {"name": "模块温度（范围）", "value": temp_rng},
@@ -1941,6 +2611,14 @@ def analyze_order_log(
         {"name": "枪口状态变迁", "value": stop_info["gun_transition"]},
         {"name": "停止依据", "value": stop_info["evidence"]},
         {"name": "停止提示", "value": stop_info["tip"] or "-"},
+        {
+            "name": "本单异常/告警摘录",
+            "value": "；".join(fault_notes[:5]) if fault_notes else "无",
+        },
+        {
+            "name": "同桩其他枪口提示",
+            "value": "；".join(other_gun_notes[:3]) if other_gun_notes else "无",
+        },
         {"name": "是否占桩计费", "value": "是" if has_occupy else "否"},
         {"name": "占桩时长", "value": occupy_dur},
         {"name": "占桩费用", "value": _fmt_money(parking_money, money_scale) if parking_money else "0 元"},
@@ -1963,6 +2641,48 @@ def analyze_order_log(
                     "message": str(ck.get("message") or "过程与账单不一致"),
                 }
             )
+    if start_mismatch:
+        warnings.append(
+            {
+                "code": str(start_check.get("code") or "START_FAIL"),
+                "level": "warn",
+                "message": str(start_check.get("message") or "启动校验未通过"),
+            }
+        )
+    for note in fault_notes[:5]:
+        # 订单本身结算/停止正常时，TROUBLE 等仅作摘录提示，不抬成需现场核实的 warn
+        fault_level = (
+            "info"
+            if (
+                not energy_mismatch
+                and not start_mismatch
+                and not need_user_confirm
+                and stop_info["category"]
+                in {
+                    "remote_stop",
+                    "device_finish",
+                    "device_unplug",
+                    "device_occupy",
+                    "device_idle_unplug",
+                }
+            )
+            else "warn"
+        )
+        warnings.append(
+            {
+                "code": "ORDER_FAULT",
+                "level": fault_level,
+                "message": note,
+            }
+        )
+    for note in other_gun_notes[:2]:
+        warnings.append(
+            {
+                "code": "OTHER_GUN_HINT",
+                "level": "info",
+                "message": note,
+            }
+        )
 
     return {
         "mode": "charging_report",
@@ -1994,5 +2714,9 @@ def analyze_order_log(
             "filtered": bool(sid),
             "energy_checks": energy_checks,
             "energy_mismatch": energy_mismatch,
+            "start_check": start_check,
+            "start_mismatch": start_mismatch,
+            "fault_notes": fault_notes,
+            "other_gun_notes": other_gun_notes,
         },
     }

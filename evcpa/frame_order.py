@@ -149,6 +149,11 @@ def _empty_order() -> dict[str, Any]:
         "energies": [],
         "moneys": [],
         "frame_count": 0,
+        "last_slots": {},
+        "locked_slots": set(),
+        "series_issues": [],
+        "saw_charging_status": False,
+        "saw_start_frame": False,
     }
 
 
@@ -246,9 +251,67 @@ def _absorb(order: dict[str, Any], r: AnalysisResult) -> None:
             order["bill_money"] = float(money)
     elif ft in {x.upper() for x in _REALTIME_FRAMES}:
         if isinstance(energy, (int, float)) and float(energy) >= 0:
-            order["energies"].append(float(energy))
+            e = float(energy)
+            if order["energies"] and e + 1e-6 < order["energies"][-1]:
+                order["series_issues"].append(
+                    f"过程总电量回落：{order['energies'][-1]} → {e} kWh（{ft}）"
+                )
+            order["energies"].append(e)
         if isinstance(money, (int, float)) and float(money) >= 0:
             order["moneys"].append(float(money))
+        # 分时槽位：tou_*_energy / slot_*_energy
+        slots: dict[str, float] = {}
+        for name, item in fmap.items():
+            if not name.endswith("_energy"):
+                continue
+            if not (name.startswith("tou_") or name.startswith("slot_")):
+                continue
+            if name.endswith("_price") or name == "slot_energy_sum":
+                continue
+            val = item.value if hasattr(item, "value") else item
+            try:
+                slots[name] = float(val)
+            except (TypeError, ValueError):
+                continue
+        if slots:
+            prev = order.get("last_slots") or {}
+            locked: set[str] = order.get("locked_slots") or set()
+            growing = {
+                k for k, v in slots.items() if k in prev and v > prev[k] + 1e-6
+            }
+            total_up = bool(order["energies"] and len(order["energies"]) >= 2 and order["energies"][-1] > order["energies"][-2] + 1e-6)
+            for k in locked:
+                if k in slots and k in prev and abs(slots[k] - prev[k]) > 1e-6:
+                    order["series_issues"].append(
+                        f"非所属时段分时“{k}”变动：{prev[k]} → {slots[k]} kWh"
+                    )
+            for k, v in slots.items():
+                if k in prev and v + 1e-6 < prev[k]:
+                    order["series_issues"].append(
+                        f"分时“{k}”回落：{prev[k]} → {v} kWh"
+                    )
+            if total_up or growing:
+                for k, pv in prev.items():
+                    if k in growing:
+                        continue
+                    if pv > 1e-6:
+                        locked.add(k)
+            order["locked_slots"] = locked
+            order["last_slots"] = slots
+
+        # 枪口充电中
+        for name, item in fmap.items():
+            if "status" not in name:
+                continue
+            meaning = ""
+            if hasattr(item, "meaning") and item.meaning:
+                meaning = str(item.meaning)
+            val = item.value if hasattr(item, "value") else item
+            if meaning in {"充电中", "操作中"} or val == 2:
+                order["saw_charging_status"] = True
+
+    if ft in {x.upper() for x in _START_FRAMES}:
+        order["saw_start_frame"] = True
 
     if not order["start_way"]:
         tf = _get_meaning(fmap, "txn_flag")
@@ -510,7 +573,79 @@ def aggregate_frame_order(
 
     has_bill = any(o.get("bill_energy") is not None for o in orders)
     valid = has_bill or any(o.get("trade_no") and o["trade_no"] != "-" for o in orders)
-    if has_bill:
+
+    # 过程电量递增 / 非所属时段固化 / 启动校验（协议多帧）
+    series_issues: list[str] = []
+    for od in orders:
+        series_issues.extend(list(od.get("series_issues") or [])[:5])
+    start_bits: list[str] = []
+    start_ok_proto = True
+    if primary.get("saw_start_frame") or primary.get("start_way"):
+        start_bits.append("有启动相关帧/启动方式")
+    else:
+        start_bits.append("未见启动帧")
+        start_ok_proto = False
+    if primary.get("saw_charging_status"):
+        start_bits.append("枪口进入充电中")
+    else:
+        # 仅有电量/电流也可侧面证明启动成功
+        if primary.get("currs") or primary.get("volts") or primary.get("energies"):
+            start_bits.append("有电流/电压/电量过程数据（侧面证明已启动）")
+        else:
+            start_bits.append("未见枪口 CHARGING/充电中状态")
+            start_ok_proto = False
+    if primary.get("currs") or primary.get("volts"):
+        start_bits.append("有电流或电压上报")
+    else:
+        start_bits.append("无电流/电压上报")
+        start_ok_proto = False
+    if primary.get("energies"):
+        start_bits.append("有电量过程上报")
+    else:
+        start_bits.append("无电量过程上报")
+        start_ok_proto = False
+    start_msg = ("启动校验通过：" if start_ok_proto else "启动校验异常：") + "；".join(start_bits)
+
+    fields.insert(
+        -1 if fields else 0,
+        {"name": "启动校验", "value": "通过" if start_ok_proto else "异常"},
+    )
+    fields.insert(
+        -1 if fields else 0,
+        {"name": "启动校验说明", "value": start_msg},
+    )
+    fields.insert(
+        -1 if fields else 0,
+        {
+            "name": "过程电量序列校验",
+            "value": "异常" if series_issues else "通过",
+        },
+    )
+    if series_issues:
+        fields.append({"name": "过程电量序列异常", "value": "；".join(series_issues[:3])})
+        for msg in series_issues[:5]:
+            warnings.append({"code": "ENERGY_SERIES", "level": "warn", "message": msg})
+        valid = False
+        points.append(f"{len(points) + 1}. 过程电量序列异常：" + "；".join(series_issues[:2]))
+    if not start_ok_proto:
+        warnings.append({"code": "START_FAIL", "level": "warn", "message": start_msg})
+        valid = False
+        points.append(f"{len(points) + 1}. {start_msg}")
+    else:
+        points.append(f"{len(points) + 1}. {start_msg}")
+
+    if series_issues or not start_ok_proto:
+        bits = []
+        if not start_ok_proto:
+            bits.append("启动校验未通过")
+        if series_issues:
+            bits.append("过程电量序列异常")
+        verdict = (
+            f"综合判断：{'、'.join(bits)}，请复核后再确认。\n"
+            "需到设备上核实相关数据，请设备方协助排查。"
+        )
+        valid = False
+    elif has_bill:
         verdict = f"综合判断：已从协议抓包日志还原 {len(orders)} 笔订单的过程与结算字段。"
     elif orders:
         verdict = (
