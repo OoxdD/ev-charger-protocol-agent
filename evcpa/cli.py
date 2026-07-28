@@ -96,7 +96,7 @@ def analyze(
 @app.command("serve")
 def serve(
     host: str = typer.Option("127.0.0.1", "--host"),
-    port: int = typer.Option(8080, "--port"),
+    port: int = typer.Option(6894, "--port"),
 ) -> None:
     """启动可视化分析页面与 HTTP API。"""
     import uvicorn

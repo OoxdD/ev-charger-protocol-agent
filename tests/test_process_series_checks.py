@@ -81,4 +81,38 @@ def test_start_success_requires_charging_and_process_data():
     )
     assert bad["ok"] is False
     assert bad["code"] == "START_FAIL"
-    assert "启动成功响应" in bad["message"] or "CHARGING" in bad["message"]
+    assert "过程数据" in bad["message"]
+
+
+def test_start_success_by_process_data_without_start_ack():
+    """无启动充电响应，但有电流/电压/电量过程数据 → 仍判启动成功。"""
+    ok = _check_start_success(
+        start_ok=False,
+        is_card_start=False,
+        is_vin_start=False,
+        is_remote_start=False,
+        has_remote_cmd=False,
+        gun_events=[],
+        gun="1",
+        socs=[{"batteryChargerOutputCurrent": 80000, "batteryChargerOutputVoltage": 350000}],
+        chgs=[{"totalBattery": 500}],
+    )
+    assert ok["ok"] is True
+    assert ok["code"] == "START_OK"
+    assert "电流/电压" in ok["message"] or "电量" in ok["message"]
+
+
+def test_start_success_by_energy_only_without_ack():
+    ok = _check_start_success(
+        start_ok=False,
+        is_card_start=False,
+        is_vin_start=False,
+        is_remote_start=False,
+        has_remote_cmd=False,
+        gun_events=[],
+        gun=None,
+        socs=[],
+        chgs=[{"totalBattery": 1200}],
+    )
+    assert ok["ok"] is True
+    assert ok["code"] == "START_OK"

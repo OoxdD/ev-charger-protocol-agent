@@ -2,27 +2,22 @@
 from evcpa.order_report import _check_process_vs_bill
 
 
-def test_accuracy_flag_wan_fen_bill_vs_meter():
-    """蔚景账单 accuracyFlag=4（万分位）与表计千分位应对齐为同一 kWh。"""
-    from evcpa.order_report import _accuracy_scale, _check_process_vs_bill, _fmt_kwh
-
+def test_zero_meters_skip_meter_vs_bill():
+    """起止表码均为 0（未上报）时，不应因差额 0 vs 账单电量误报 METER_MISMATCH。"""
     bill = {
-        "accuracyFlag": 4,
-        "totalBattery": 13820,
+        "totalBattery": 14300,
         "jianBattery": 0,
         "fengBattery": 0,
-        "pingBattery": 13820,
+        "pingBattery": 14300,
         "guBattery": 0,
+        "chargeStartMeterBattery": 0,
+        "chargeEndMeterBattery": 0,
     }
-    assert _accuracy_scale(bill) == 10000
-    assert _fmt_kwh(13820, 10000) == "1.382 kwh"
-    # 表计用千分位：2323205→2323.205，差额 1.382
-    checks = _check_process_vs_bill(
-        None, bill, 2323205, 2324587, meter_scale=1000
-    )
-    meter = next(c for c in checks if c["code"].startswith("METER"))
+    checks = _check_process_vs_bill(None, bill, 0, 0, meter_scale=1000)
+    meter = next(c for c in checks if str(c.get("code", "")).startswith("METER"))
     assert meter["ok"] is True
-    assert "1.382" in meter["message"]
+    assert meter["code"] == "METER_SKIP"
+    assert not any(c.get("code") == "METER_MISMATCH" for c in checks)
 
 
 def test_total_close_within_tolerance():
@@ -118,3 +113,43 @@ def test_high_power_widens_total_tolerance():
     total = next(c for c in checks if c["code"].startswith("TOTAL"))
     assert total["ok"] is True
     assert "容差" in total["message"]
+
+
+def test_energy_vs_power_time_ok():
+    from evcpa.order_report import _check_energy_vs_power_time
+
+    # 40 kW × 1 h = 40 kWh，实际 38 在容差内
+    r = _check_energy_vs_power_time(energy_kwh=38.0, power_kw=40.0, duration_sec=3600)
+    assert r["ok"] is True
+    assert r["code"] == "POWER_TIME_OK"
+
+
+def test_energy_vs_power_time_mismatch():
+    from evcpa.order_report import _check_energy_vs_power_time
+
+    # 40 kW × 1 h = 40，实际 10 明显不合理
+    r = _check_energy_vs_power_time(energy_kwh=10.0, power_kw=40.0, duration_sec=3600)
+    assert r["ok"] is False
+    assert r["code"] == "POWER_TIME_MISMATCH"
+
+
+def test_energy_vs_power_time_in_order_report():
+    from evcpa.order_report import analyze_order_log
+
+    text = "\n".join(
+        [
+            '2026-07-15 20:00:00 [x] RemoteCmd>>>>>>>>:{"remoteCmd":"17","data":{"serviceId":"920","interfaceCode":"1"}}',
+            "2026-07-15 20:00:01 [x] 1枪:CHARGING",
+            # ~40 kW，持续约 1 小时 → 期望约 40 kWh；账单 38 合理
+            '2026-07-15 20:10:00 [x] --socInfo:{"serviceId":920,"interfaceCode":"1","batteryChargerOutputCurrent":100000,"batteryChargerOutputVoltage":400000,"batteryChargerOutPower":40000}',
+            '2026-07-15 20:30:00 [x] --socInfo:{"serviceId":920,"interfaceCode":"1","batteryChargerOutputCurrent":100000,"batteryChargerOutputVoltage":400000,"batteryChargerOutPower":40000}',
+            '2026-07-15 20:50:00 [x] --chargingInfo:{"serviceId":920,"interfaceCode":"1","totalBattery":38000,"chargeMoney":100,"chargeDuration":3600}',
+            '2026-07-15 21:00:00 [x] --recordInfo:{"serviceId":920,"interfaceCode":"1","totalBattery":38000,"chargeMoney":100,"chargeDuration":3600,"chargeStartMeterBattery":0,"chargeEndMeterBattery":38000}',
+            "2026-07-15 21:00:01 [x] 1枪:IDLE",
+        ]
+    )
+    r = analyze_order_log(text, service_id="920")
+    pt = (r.get("extras") or {}).get("power_time_check") or {}
+    assert pt.get("code") == "POWER_TIME_OK"
+    fields = {f["name"]: f["value"] for f in r["fields"]}
+    assert fields.get("功率×时间电量校验") == "通过"

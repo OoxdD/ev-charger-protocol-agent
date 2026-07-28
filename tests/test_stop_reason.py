@@ -24,6 +24,31 @@ def test_remote_stop_cmd18_uses_stop_reason_msg():
     assert any("平台下发远程停止，" in p and "remoteCmd" not in p for p in r["result_points"])
 
 
+def test_remote_stop_without_reason_is_user_remote_stop():
+    """远程停止无具体 stopReasonMsg → 一般判定为用户远程停止。"""
+    text = "\n".join(
+        [
+            '2026-07-15 20:13:51 [x] RemoteCmd>>>>>>>>:{"remoteCmd":"17","deviceNo":"P1","interfaceCode":"2","data":{"serviceId":"501","tradeNo":"T1"}}',
+            "2026-07-15 20:14:26 [x] 启动充电响应:成功",
+            "2026-07-15 20:14:33 [x] 1枪:IDLE|2枪:CHARGING| nid:x",
+            '2026-07-15 20:14:34 [x] --chargingInfo:{"serviceId":501,"interfaceCode":"2","tradeNo":"T1","totalBattery":20,"chargeMoney":15}',
+            '2026-07-15 21:16:21 [x] RemoteCmd>>>>>>>>:{"remoteCmd":"18","deviceNo":"P1","interfaceCode":"2","data":{"serviceId":501,"interfaceCode":"2"}}',
+            "2026-07-15 21:16:33 [x] 1枪:IDLE|2枪:OCCUPYING| nid:x",
+            '2026-07-15 21:16:40 [x] --recordInfo:{"serviceId":501,"interfaceCode":"2","tradeNo":"T1","totalBattery":28710,"chargeMoney":20000,"deviceChargeFinishReasonMsg":"平台主动停止","deviceChargeFinishReasonCode":47}',
+        ]
+    )
+    r = analyze_order_log(text, service_id="501")
+    fields = {f["name"]: f["value"] for f in r["fields"]}
+    assert r["extras"]["has_remote_stop"] is True
+    assert r["extras"]["stop_category"] == "user_remote_stop"
+    assert fields["停止类型"] == "用户远程停止"
+    assert "用户远程停止" in fields["停止原因"]
+    assert fields["平台停止原因"] == "-"
+    assert fields["设备结束原因"] == "平台主动停止"
+    assert any("用户远程停止" in p for p in r["result_points"])
+    assert r["extras"]["stop_reason"] == fields["停止原因"]
+
+
 def test_device_unplug_ready_charge():
     text = "\n".join(
         [
@@ -167,6 +192,26 @@ def test_idle_unplug_and_estop_suspect():
     )
     assert estop["category"] == "estop_suspect"
     assert "急停" in estop["tip"]
+    assert "无告警" in estop["tip"] or "无告警" in estop["evidence"]
+
+    # 短暂 TROUBLE + 有告警 → 真实枪口故障，非急停
+    fault_with_alarm = _analyze_stop(
+        has_remote_stop=False,
+        remote_stop_msg=None,
+        finish_msg="设备故障",
+        finish_code=None,
+        gun_events=[
+            ("t1", "1", "CHARGING"),
+            ("t2", "1", "TROUBLE"),
+            ("t3", "1", "READY_CHARGE"),
+        ],
+        gun="1",
+        alarm_notes=["2026-07-25 10:00:00　告警码 34：充电枪锁定异常"],
+    )
+    assert fault_with_alarm["category"] == "gun_fault"
+    assert "急停" not in fault_with_alarm["stop_type"]
+    assert "告警" in fault_with_alarm["tip"]
+    assert "设备方" in fault_with_alarm["tip"]
 
     fault = _analyze_stop(
         has_remote_stop=False,
@@ -184,6 +229,27 @@ def test_idle_unplug_and_estop_suspect():
         gun="1",
     )
     assert fault["category"] == "gun_fault"
+
+
+def test_brief_trouble_with_alarm_in_order_log_is_gun_fault_not_estop():
+    text = "\n".join(
+        [
+            '2026-07-25 10:00:00 [x] --chargingInfo:{"serviceId":"801","interfaceCode":1,"totalBattery":500,"chargeMoney":10}',
+            "2026-07-25 10:00:01 [x] 1枪:CHARGING",
+            '2026-07-25 10:01:00 [x] --socInfo:{"serviceId":"801","interfaceCode":1,"batteryChargerOutputCurrent":1000,"batteryChargerOutputVoltage":400000}',
+            "2026-07-25 10:05:00 [x] 告警上报，告警码：34  内容：充电枪锁定异常",
+            "2026-07-25 10:05:01 [x] 1枪:TROUBLE",
+            "2026-07-25 10:05:10 [x] 1枪:READY_CHARGE",
+            '2026-07-25 10:05:20 [x] --recordInfo:{"serviceId":"801","interfaceCode":1,"totalBattery":500,"chargeMoney":10,"deviceChargeFinishReasonMsg":"故障停止"}',
+        ]
+    )
+    r = analyze_order_log(text, service_id="801")
+    assert r["extras"]["stop_category"] == "gun_fault"
+    fields = {f["name"]: f["value"] for f in r["fields"]}
+    assert fields["停止类型"] == "枪口故障停止"
+    assert "急停" not in fields["停止类型"]
+    assert "充电枪锁定异常" in fields["告警信息"]
+    assert "设备方" in (fields.get("停止提示") or "")
 
 
 def test_precharge_trouble_then_charging_ignored():

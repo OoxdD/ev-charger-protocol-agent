@@ -200,6 +200,14 @@ class WeijingParser(ProtocolParser):
             )
         else:
             fields.extend(self._parse_body(cmd, body, body_base))
+            if cmd == 0x0D:
+                warnings.append(
+                    WarningItem(
+                        code="WEIJING_ALARM",
+                        level="warn",
+                        message=f"设备上报告警帧(0x0D)，体长 {len(body)} 字节",
+                    )
+                )
 
         fields = [self._with_label(f) for f in fields]
         summary = f"蔚景 {PROTOCOL_VERSION} {cmd_name}（0x{cmd:02X}），桩号={pile}，序号={seq}，消息体 {len(body)} 字节"
@@ -244,6 +252,8 @@ class WeijingParser(ProtocolParser):
             return self._parse_heartbeat(body, base)
         if cmd == 0x8C:
             return self._parse_heartbeat_ack(body, base)
+        if cmd == 0x0D:
+            return self._parse_alarm(body, base)
         if cmd == 0x06:
             return self._parse_remote_start(body, base)
         if cmd == 0x86:
@@ -414,6 +424,30 @@ class WeijingParser(ProtocolParser):
                 meaning="服务器时间",
             )
         ]
+
+    def _parse_alarm(self, body: bytes, base: int) -> list[FieldItem]:
+        """0x0D 告警：优先解析枪号，其余作为告警载荷十六进制。"""
+        items: list[FieldItem] = []
+        if not body:
+            return items
+        o = 0
+        if self._need(body, o, 1):
+            items.append(
+                FieldItem(name="gun_no", value=body[o], offset=base + o, length=1, meaning="枪号")
+            )
+            o += 1
+        if o < len(body):
+            rest = body[o:]
+            items.append(
+                FieldItem(
+                    name="alarm_payload",
+                    value=to_hex(rest, spaced=False),
+                    offset=base + o,
+                    length=len(rest),
+                    meaning="告警内容",
+                )
+            )
+        return items
 
     def _parse_remote_start(self, body: bytes, base: int) -> list[FieldItem]:
         items: list[FieldItem] = []

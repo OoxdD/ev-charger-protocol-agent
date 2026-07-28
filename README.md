@@ -63,9 +63,9 @@ evcpa analyze --json "{\"cmd\":\"login\",\"pileNo\":\"3201020001\"}"
 evcpa protocols
 
 # 启动可视化分析页面（浏览器打开提示的地址）
-evcpa serve --host 0.0.0.0 --port 8080
-# 页面: http://127.0.0.1:8080/
-# 接口: http://127.0.0.1:8080/docs
+evcpa serve --host 0.0.0.0 --port 6894
+# 页面: http://127.0.0.1:6894/
+# 接口: http://127.0.0.1:6894/docs
 ```
 
 ### Python API
