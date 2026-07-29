@@ -39,6 +39,18 @@ def test_analyze_payload_multi_frame_order():
     fields = {f["name"]: f["value"] for f in data["fields"]}
     assert str(fields["订单流水号"]).startswith("20250914520101")
     assert fields["解析帧数"] == "2"
+    # 与 JSON 订单报告字段对齐的关键项应存在
+    for name in (
+        "启动方式",
+        "启动结果",
+        "启动校验",
+        "停止类型",
+        "停止原因",
+        "功率×时间电量校验",
+        "过程与账单校验",
+        "是否有远程停止指令",
+    ):
+        assert name in fields
 
 
 def test_analyze_payload_single_still_works():

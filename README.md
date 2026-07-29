@@ -10,14 +10,14 @@
 | 蔚景科技 | `weijing` | TCP 二进制帧 `0x68` + ASCII 桩号 + CRC16-XMODEM（**运营协议 V2.6**） |
 | 万马新能源 | `wanma` | TCP 二进制帧 `AA BB 55 99` + BCD 设备编码 + CRC32（**2020 V1.00**） |
 | 星星充电 | `xingxing` | JSON / MQTT 业务报文 |
-| 盛宏 | `shenghong` | 二进制帧 / ASCII 扩展 |
+| 盛弘 | `shenghong` | TCP 二进制帧 `AA F5` + 累计和（**后台通信 V5.2B**）/ JSON |
 | 华为 | `huawei` | JSON IoT / FusionCharge 风格 |
 | 英飞源 | `infypower` | 模块/桩侧二进制与 JSON |
 | OCPP | `ocpp` | OCPP 1.6/2.0.1 Call JSON 数组 |
 | 中电联互联互通 | `cec` | T/CEC 102.* 平台对接 JSON |
 | 特来电 | `teld` | 运营商 JSON / 私有帧 |
 | 国家电网 | `sgcc` | 国网风格 JSON / IEC104 衍生 |
-| 南方电网 | `csg` | 南网风格 JSON |
+| 南方电网 | `csg` | 南网标准接入 IEC104 扩展（2 字节长度 / 类型 130·134）/ JSON |
 | 小桔充电 | `xiaoju` | 滴滴小桔业务 JSON |
 | 奥能 | `aoneng` | 厂商 JSON / 私有帧 |
 | 普天 | `putian` | 厂商 JSON |
@@ -66,6 +66,8 @@ evcpa protocols
 evcpa serve --host 0.0.0.0 --port 6894
 # 页面: http://127.0.0.1:6894/
 # 接口: http://127.0.0.1:6894/docs
+# 页面支持「从设备拉取历史报文」→ 展示 → 人工点「开始分析」
+# 可选环境变量：EVCPA_HISTORY_LOGS_URL、EVCPA_HISTORY_LOGS_SKEY
 ```
 
 ### Python API

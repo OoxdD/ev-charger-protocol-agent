@@ -10,6 +10,18 @@
   const analyzeBtn = $("analyzeBtn");
   const clearBtn = $("clearBtn");
   const copyBtn = $("copyBtn");
+  const downloadPayloadBtn = $("downloadPayloadBtn");
+  const downloadReportBtn = $("downloadReportBtn");
+  const fetchBtn = $("fetchBtn");
+  const fetchHint = $("fetchHint");
+  const fetchDeviceNo = $("fetchDeviceNo");
+  const fetchStartDate = $("fetchStartDate");
+  const fetchStartHour = $("fetchStartHour");
+  const fetchStartMinute = $("fetchStartMinute");
+  const fetchLimit = $("fetchLimit");
+  const fetchSort = $("fetchSort");
+  const fetchCmd = $("fetchCmd");
+  const fetchDirection = $("fetchDirection");
   const emptyState = $("emptyState");
   const errorState = $("errorState");
   const resultView = $("resultView");
@@ -44,6 +56,9 @@
       "TOTAL_MISMATCH",
       "TOU_DOM_MISMATCH",
       "METER_MISMATCH",
+      "POWER_TIME_MISMATCH",
+      "BILL_MISMATCH",
+      "ENERGY_SERIES",
       "CRC_FAIL",
       "BAD_START",
       "LEN_MISMATCH",
@@ -190,9 +205,13 @@
   }
 
   function looksLikeProtocolTraceLog(text) {
-    const dirHit = (text.match(/【(?:上报|下发)\s*0x[0-9A-Fa-f]{2}】/g) || []).length;
-    const tsHit = (text.slice(0, 5000).match(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/g) || []).length;
-    return dirHit >= 2 && tsHit >= 1 && text.includes("68");
+    const dirHit = (text.match(/【(?:上报|下发)\s*0x[0-9A-Fa-f]{2,4}】/g) || []).length;
+    const cmdHit = (text.match(/\[cmd=(?:0x)?[0-9A-Fa-f]{1,4}\]/gi) || []).length;
+    const tsHit = (text.slice(0, 8000).match(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/g) || []).length;
+    const hasFrame = /(?:^|[^0-9A-Fa-f])(68|AAF5|9955BBAA|AABB5599)[0-9A-Fa-f]{6,}/i.test(text);
+    if (dirHit >= 2 && tsHit >= 1 && hasFrame) return true;
+    if (cmdHit >= 2 && tsHit >= 1 && hasFrame) return true;
+    return (dirHit >= 1 || cmdHit >= 1) && hasFrame;
   }
 
   function buildBody() {
@@ -237,6 +256,7 @@
     errorState.hidden = true;
     resultView.hidden = true;
     copyBtn.hidden = true;
+    if (downloadReportBtn) downloadReportBtn.hidden = true;
   }
 
   function showError(msg) {
@@ -245,6 +265,7 @@
     errorState.hidden = false;
     errorState.textContent = msg;
     copyBtn.hidden = true;
+    if (downloadReportBtn) downloadReportBtn.hidden = true;
   }
 
   function showResult(data) {
@@ -253,6 +274,7 @@
     errorState.hidden = true;
     resultView.hidden = false;
     copyBtn.hidden = false;
+    if (downloadReportBtn) downloadReportBtn.hidden = false;
 
     const isChoice = data.mode === "multi_order_choice";
     const isCharge = data.mode === "charging_report";
@@ -456,6 +478,111 @@
     }
   }
 
+  function pad2(n) {
+    return String(n).padStart(2, "0");
+  }
+
+  function fillTimeSelects() {
+    if (!fetchStartHour || !fetchStartMinute) return;
+    if (!fetchStartHour.options.length) {
+      for (let h = 0; h < 24; h += 1) {
+        const opt = document.createElement("option");
+        opt.value = String(h);
+        opt.textContent = pad2(h);
+        fetchStartHour.appendChild(opt);
+      }
+    }
+    if (!fetchStartMinute.options.length) {
+      for (let m = 0; m < 60; m += 1) {
+        const opt = document.createElement("option");
+        opt.value = String(m);
+        opt.textContent = pad2(m);
+        fetchStartMinute.appendChild(opt);
+      }
+    }
+  }
+
+  function setDefaultFetchTime() {
+    fillTimeSelects();
+    const now = new Date();
+    if (fetchStartDate && !fetchStartDate.value) {
+      fetchStartDate.value = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
+    }
+    if (fetchStartHour) fetchStartHour.value = String(now.getHours());
+    if (fetchStartMinute) fetchStartMinute.value = String(now.getMinutes());
+  }
+
+  function toStartTimeUnixMs() {
+    // 日期 + 时 + 分 → 本地毫秒时间戳
+    const date = fetchStartDate && fetchStartDate.value;
+    if (!date) return null;
+    const h = Number(fetchStartHour && fetchStartHour.value);
+    const m = Number(fetchStartMinute && fetchStartMinute.value);
+    if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+    const ms = Date.parse(`${date}T${pad2(h)}:${pad2(m)}:00`);
+    if (Number.isNaN(ms)) return null;
+    return ms;
+  }
+
+  async function fetchHistoryLogs() {
+    if (!fetchBtn) return;
+    const deviceNo = (fetchDeviceNo && fetchDeviceNo.value || "").trim();
+    const startMs = toStartTimeUnixMs();
+    if (!deviceNo) {
+      if (fetchHint) fetchHint.textContent = "请填写设备编号 deviceNo。";
+      return;
+    }
+    if (startMs == null) {
+      if (fetchHint) fetchHint.textContent = "请选择开始日期与时刻。";
+      return;
+    }
+    const limit = Number((fetchLimit && fetchLimit.value) || 1000);
+    const sortType = Number((fetchSort && fetchSort.value) || 1);
+    const cmd = (fetchCmd && fetchCmd.value || "").trim();
+    const dirRaw = fetchDirection && fetchDirection.value;
+    const body = {
+      device_no: deviceNo,
+      start_time: startMs,
+      sort_type: sortType,
+      limit_count: Math.min(15000, Math.max(1, limit || 1000)),
+    };
+    if (cmd) body.cmd = cmd;
+    if (dirRaw !== "" && dirRaw != null) body.is_send_log = Number(dirRaw);
+
+    fetchBtn.disabled = true;
+    fetchBtn.textContent = "拉取中…";
+    if (fetchHint) fetchHint.textContent = "正在从设备侧拉取历史报文…";
+    try {
+      const res = await fetch("/history-logs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data.detail != null ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)) : "拉取失败";
+        throw new Error(detail);
+      }
+      const text = data.text || "";
+      payload.value = text;
+      document.querySelector('.tab[data-mode="auto"]').click();
+      const count = data.count != null ? data.count : 0;
+      const msg = data.msg ? `（${data.msg}）` : "";
+      if (fetchHint) {
+        fetchHint.textContent = count
+          ? `已拉取 ${count} 条报文${msg}，已填入下方文本框。确认后点击「开始分析」。`
+          : `未查到报文${msg}。请调整设备编号或开始时间后重试。`;
+      }
+      if (fileHint) fileHint.textContent = count ? `来源：设备历史报文（${count} 条）` : "";
+      showEmpty();
+    } catch (err) {
+      if (fetchHint) fetchHint.textContent = err.message || String(err);
+    } finally {
+      fetchBtn.disabled = false;
+      fetchBtn.textContent = "拉取报文";
+    }
+  }
+
   document.querySelectorAll(".tab").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
@@ -472,6 +599,8 @@
     fileHint.textContent = `已导入：${file.name}（${Math.round(file.size / 1024)} KB）`;
     if (text.trim().startsWith("{") || text.trim().startsWith("[")) {
       document.querySelector('.tab[data-mode="json"]').click();
+    } else if (looksLikeProtocolTraceLog(text) || looksLikeOrderLog(text)) {
+      document.querySelector('.tab[data-mode="auto"]').click();
     } else {
       document.querySelector('.tab[data-mode="hex"]').click();
     }
@@ -482,8 +611,63 @@
     if (orderFilterInput) orderFilterInput.value = "";
     fileInput.value = "";
     fileHint.textContent = "";
+    if (fetchHint) fetchHint.textContent = "拉取后先展示在下方，确认后再分析。";
     showEmpty();
   });
+
+  if (fetchBtn) fetchBtn.addEventListener("click", fetchHistoryLogs);
+
+  function stampName(prefix, ext) {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    return `${prefix}_${stamp}.${ext}`;
+  }
+
+  function downloadTextFile(filename, text) {
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function reportFileBase(data) {
+    const ex = (data && data.extras) || {};
+    const sid = ex.service_id || ex.trade_no || "";
+    const device = (fetchDeviceNo && fetchDeviceNo.value || "").trim();
+    const tag = String(sid || device || "report").replace(/[^\w\u4e00-\u9fa5-]+/g, "_").slice(0, 40);
+    return `解析报告_${tag || "report"}`;
+  }
+
+  if (downloadPayloadBtn) {
+    downloadPayloadBtn.addEventListener("click", () => {
+      const text = (payload.value || "").trim();
+      if (!text) {
+        const tip = "当前没有可下载的报文内容。";
+        if (fetchHint) fetchHint.textContent = tip;
+        else if (fileHint) fileHint.textContent = tip;
+        return;
+      }
+      const device = (fetchDeviceNo && fetchDeviceNo.value || "").trim();
+      const prefix = device ? `报文_${device}` : "报文";
+      downloadTextFile(stampName(prefix, "txt"), text);
+      if (fetchHint) fetchHint.textContent = "报文已开始下载。";
+      else if (fileHint) fileHint.textContent = "报文已开始下载。";
+    });
+  }
+
+  if (downloadReportBtn) {
+    downloadReportBtn.addEventListener("click", () => {
+      if (!lastResult) return;
+      const text = buildShareText(lastResult);
+      downloadTextFile(stampName(reportFileBase(lastResult), "txt"), text);
+    });
+  }
 
   copyBtn.addEventListener("click", async () => {
     if (!lastResult) return;
@@ -655,6 +839,8 @@
   payload.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") analyze();
   });
+
+  setDefaultFetchTime();
 
   loadProtocols().catch((err) => {
     protocolCount.textContent = "协议列表加载失败";

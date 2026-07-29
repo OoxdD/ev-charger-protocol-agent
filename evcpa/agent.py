@@ -5,6 +5,7 @@ from typing import Any
 
 from evcpa.detect import detect_best
 from evcpa.frame_order import aggregate_frame_order, has_order_signal
+from evcpa.csg_session import aggregate_csg_session
 from evcpa.framing import split_frames
 from evcpa.models import AnalysisResult, ProtocolId, WarningItem
 from evcpa.protocol_log import extract_frames_from_protocol_log, looks_like_protocol_trace_log
@@ -40,14 +41,25 @@ _WANMA_MAGIC_BE = bytes.fromhex("9955BBAA")
 
 def _protocol_hint_from_bytes(data: bytes, cmd_hint: str | None = None) -> str | None:
     """按帧头/命令字给出协议提示；无法判断时返回 None 交给自动识别。"""
+    from evcpa.framing import classify_frame
+
     if len(data) >= 4 and data[:4] in (_WANMA_MAGIC_LE, _WANMA_MAGIC_BE):
         return "wanma"
-    cmd = (cmd_hint or "").upper()
+    if len(data) >= 2 and data[0] == 0xAA and data[1] == 0xF5:
+        return "shenghong"
+    cmd = (cmd_hint or "").upper().lstrip("0X")
     # 万马命令字多为 4 位（如 2002）；云快充多为 2 位
-    if len(cmd) == 4:
+    if len(cmd) == 4 and cmd not in {"0000"}:
         return "wanma"
+    # 南网日志 cmd 常为 ASDU 类型：00/01/0B/82/84/85
+    if cmd in {"00", "0", "01", "1", "0B", "B", "82", "84", "85", "86"}:
+        if data[:1] == b"\x68":
+            return "csg"
     if data[:1] == b"\x68":
-        return "ykc"
+        hint = classify_frame(data)
+        if hint in {"csg", "weijing", "ykc"}:
+            return hint
+        return None
     return None
 
 
@@ -157,7 +169,7 @@ class ProtocolAgent:
             try:
                 raw = parse_hex(hex_text)
             except ValueError as e:
-                # 可能是夹杂时间戳的抓包文本
+                # 可能是夹杂时间戳/[cmd=] 的抓包文本，误走了 hex 通道
                 if looks_like_protocol_trace_log(hex_text):
                     return self._analyze_protocol_trace_log(
                         hex_text, protocol=protocol, service_id=service_id, trade_no=trade_no
@@ -256,6 +268,20 @@ class ProtocolAgent:
             }
             return one
 
+        csg_n = sum(1 for r in detail_results if r.protocol.value == "csg")
+        if csg_n >= max(3, len(detail_results) // 2):
+            report = aggregate_csg_session(
+                detail_results,
+                meta={"pile": pile, "source": "protocol_trace_log"},
+            )
+            report["extras"] = {
+                **(report.get("extras") or {}),
+                "source": "protocol_trace_log",
+                "extracted_frames": len(log_frames),
+                "link_placeholder": skipped_link,
+            }
+            return report
+
         if has_order_signal(results):
             report = aggregate_frame_order(
                 results,
@@ -327,6 +353,10 @@ class ProtocolAgent:
                 "candidates": results[0].extras.get("candidates") if results else [],
             }
             return report
+
+        csg_n = sum(1 for r in results if r.protocol.value == "csg")
+        if csg_n >= max(3, len(results) // 2):
+            return aggregate_csg_session(results, meta={"source": "protocol_frames"})
 
         first = results[0]
         warnings: list[dict[str, Any]] = []

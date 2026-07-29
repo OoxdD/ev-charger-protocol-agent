@@ -3,12 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from evcpa.agent import ProtocolAgent
+from evcpa.history_logs import fetch_device_history_logs, logs_to_text
 from evcpa.order_report import analyze_order_log, looks_like_order_log
 
 agent = ProtocolAgent()
@@ -35,6 +36,15 @@ class AnalyzeRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class HistoryLogsRequest(BaseModel):
+    device_no: str = Field(..., description="设备编号 deviceNo")
+    start_time: int = Field(..., description="开始时间戳（毫秒）")
+    cmd: Optional[str] = Field(None, description="报文命令，可选")
+    is_send_log: Optional[int] = Field(None, description="1=只查下行，0=上行，不传=全部")
+    sort_type: Optional[int] = Field(1, description="排序，默认1正序，<0倒序")
+    limit_count: Optional[int] = Field(1000, description="最大条数，默认1000，最长15000")
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(
@@ -51,6 +61,41 @@ def health() -> dict[str, str]:
 @app.get("/protocols")
 def protocols() -> list[dict[str, str]]:
     return agent.list_protocols()
+
+
+@app.post("/history-logs")
+def history_logs(req: HistoryLogsRequest) -> dict[str, Any]:
+    """代理拉取设备历史报文，拼成文本供页面展示；不自动分析。"""
+    try:
+        remote = fetch_device_history_logs(
+            device_no=req.device_no,
+            start_time=req.start_time,
+            cmd=req.cmd,
+            is_send_log=req.is_send_log,
+            sort_type=req.sort_type,
+            limit_count=req.limit_count,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+    code = remote.get("code")
+    msg = remote.get("msg")
+    items = remote.get("data")
+    if not isinstance(items, list):
+        items = []
+    text = logs_to_text(items)
+    # 对接方成功码常见为 1 / 0 / 200
+    ok = code in (0, "0", 1, "1", 200, "200", None) or bool(items)
+    return {
+        "ok": bool(ok),
+        "code": code,
+        "msg": msg,
+        "count": len(items),
+        "logs": items,
+        "text": text,
+    }
 
 
 @app.post("/analyze")

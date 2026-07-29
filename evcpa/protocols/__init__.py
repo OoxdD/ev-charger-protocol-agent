@@ -3,6 +3,7 @@ from __future__ import annotations
 from evcpa.protocols.ascii68 import Ascii68Parser
 from evcpa.protocols.base import ProtocolParser
 from evcpa.protocols.cec import CecParser
+from evcpa.protocols.csg import CsgParser
 from evcpa.protocols.huawei import HuaweiParser
 from evcpa.protocols.iec104 import Iec104Parser
 from evcpa.protocols.infypower import InfypowerParser
@@ -12,7 +13,6 @@ from evcpa.protocols.vendors_extra import (
     AbbParser,
     AnyueParser,
     AonengParser,
-    CsgParser,
     DakuyunParser,
     EverchargeParser,
     KamaisiParser,
@@ -42,17 +42,17 @@ def all_parsers() -> list[ProtocolParser]:
         YkcParser(),
         WanmaParser(),
         Ascii68Parser(),
+        ShenghongParser(),
+        CsgParser(),
         OcppParser(),
         Iec104Parser(),
         CecParser(),
         XingxingParser(),
-        ShenghongParser(),
         HuaweiParser(),
         InfypowerParser(),
         # 运营商 / 厂商
         TeldParser(),
         SgccParser(),
-        CsgParser(),
         XiaojuParser(),
         AonengParser(),
         PutianParser(),
@@ -83,6 +83,7 @@ __all__ = [
     "InfypowerParser",
     "OcppParser",
     "CecParser",
+    "CsgParser",
     "Iec104Parser",
     "Ascii68Parser",
     "all_parsers",

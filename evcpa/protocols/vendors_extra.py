@@ -31,17 +31,6 @@ class SgccParser(JsonHeuristicParser):
     BINARY_MAGIC = b"\xEB\x90"
 
 
-class CsgParser(JsonHeuristicParser):
-    protocol_id = ProtocolId.CSG
-    protocol_name = "南方电网"
-    KEYS = {
-        "csg", "CSG", "southGrid", "pileNo", "connectorNo", "chargeOrderNo",
-        "runStatus", "elecQuantity", "chargeFee",
-    }
-    KEYWORDS = ("csg", "southgrid", "南方电网", "南网", "nanwang")
-    STATUS_VENDOR = "csg"
-
-
 class XiaojuParser(JsonHeuristicParser):
     protocol_id = ProtocolId.XIAOJU
     protocol_name = "小桔充电"

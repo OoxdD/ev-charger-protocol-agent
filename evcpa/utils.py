@@ -7,18 +7,25 @@ from typing import Any
 _HEX_CLEAN = re.compile(r"[^0-9a-fA-F]")
 # 平台日志标签：【上报 0x13】/【下发 0x2002】，其中的 0xNN 不能并入报文 hex
 _LOG_DIR_TAG = re.compile(r"【\s*(?:上报|下发)\s*0x[0-9A-Fa-f]+\s*】", re.IGNORECASE)
+# 历史报文格式：[cmd=0x13][上行|下行] 或南网 [cmd=00]
+_LOG_CMD_BRACKET = re.compile(
+    r"\[cmd=(?:0x)?[0-9A-Fa-f]{1,4}\](?:\s*\[(?:上行|下行|上报|下发)\])?",
+    re.IGNORECASE,
+)
 _FRAME_STARTS = (
     "9955BBAA",  # 万马 LE
     "AABB5599",  # 万马 BE
-    "68",        # 云快充/蔚景等
+    "AAF5",      # 盛弘
+    "68",        # 云快充/蔚景/南网等
 )
 
 
 def parse_hex(text: str) -> bytes:
     """Accept hex with spaces, 0x prefixes, commas, log tags, or continuous string."""
     cleaned = text.strip()
-    # 先去掉上报/下发标签，避免 0x2002 等命令字污染真实帧
+    # 先去掉上报/下发标签与 [cmd=0x..] 标记，避免命令字污染真实帧
     cleaned = _LOG_DIR_TAG.sub(" ", cleaned)
+    cleaned = _LOG_CMD_BRACKET.sub(" ", cleaned)
     cleaned = cleaned.replace("0x", "").replace("0X", "")
     cleaned = _HEX_CLEAN.sub("", cleaned)
     if not cleaned:

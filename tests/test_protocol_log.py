@@ -20,12 +20,31 @@ def test_protocol_trace_detect_and_extract():
     assert "3B" in cmds
 
 
+def test_history_cmd_bracket_format():
+    text = "\n".join(
+        [
+            "2026-07-26 10:35:05.433 [cmd=0x34] [下行] 683097CF003420250703170601012607261035058985202507031706010100000136009413670000013600941367C1300000106A",
+            "2026-07-26 10:35:05.963 [cmd=0x33] [上行] 681E97CF0033202507031706010126072610350589852025070317060101010007FB",
+            "2026-07-26 10:35:40.701 [cmd=0x13] [上行] 6840E9540013202507031706010126072610350589852025070317060101030201540DF8035000000000000000002851000032000000000000000000000000000000E12D",
+        ]
+    )
+    assert looks_like_protocol_trace_log(text)
+    frames = extract_frames_from_protocol_log(text)
+    assert len(frames) == 3
+    assert frames[0].cmd_hint == "34"
+    assert frames[0].direction == "下发"
+    assert frames[1].direction == "上报"
+    data = ProtocolAgent().analyze_payload(text=text, protocol="ykc")
+    assert data["mode"] == "charging_report"
+    fields = {f["name"]: f["value"] for f in data["fields"]}
+    assert "20250703170601" in str(fields.get("充电桩编号", ""))
+
+
 def test_protocol_trace_order_aggregate():
     if not SAMPLE.exists():
         return
     text = SAMPLE.read_text(encoding="utf-8", errors="ignore")
     agent = ProtocolAgent()
-    # 未指定筛选：多订单应提示选择
     choice = agent.analyze_payload(text=text)
     assert choice["mode"] == "multi_order_choice"
     assert choice["extras"]["need_order_filter"] is True
