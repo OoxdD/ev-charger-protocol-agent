@@ -17,13 +17,19 @@ _CHARGING_INFO = re.compile(r"--chargingInfo:(\{.*\})")
 _RECORD_INFO = re.compile(r"--recordInfo:(\{.*\})")
 _BILL_CMD8 = re.compile(r"上报账单\[cmd=0x8\]:(\{.*\})")
 _BILL_ANY = re.compile(r"上报账单\[cmd=0x[0-9A-Fa-f]+\]:(\{.*\})")
-_GUN_STATUS = re.compile(r"(\d+)枪[:：]([A-Z_]+)")
+_GUN_STATUS = re.compile(r"(\d+)枪[:：]?([A-Z_]+)")
 _TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)")
 _SEP = "=" * 80
 
 
 def _parse_gun_statuses(ln: str) -> list[tuple[str, str]]:
-    """解析枪口状态。兼容单枪与多枪管道格式，如「1枪:IDLE|2枪:CHARGING|」。"""
+    """解析枪口状态。
+
+    兼容：
+    - 「1枪:IDLE|2枪:CHARGING|」
+    - 「1枪：CHARGING」
+    - 「1枪CHARGING」（无冒号，星星等）
+    """
     return _GUN_STATUS.findall(ln)
 
 
@@ -498,6 +504,62 @@ def _duration_seconds(start_iso: str | None, end_iso: str | None) -> int | None:
         return sec if sec >= 0 else None
     except ValueError:
         return None
+
+
+def _parse_event_ts(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    s = str(ts).strip()
+    if "." in s[:26]:
+        try:
+            return datetime.strptime(s[:26].ljust(26, "0")[:26], "%Y-%m-%d %H:%M:%S.%f")
+        except ValueError:
+            pass
+    try:
+        return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _charging_duration_from_gun_events(
+    gun_events: list[tuple[str, str, str]],
+    gun: str | None,
+) -> tuple[int | None, str | None, str | None]:
+    """按枪口处于 CHARGING 的时段累计实际充电时长。
+
+    离开 CHARGING（如变为 OCCUPYING）即结束该段计时；多段 CHARGING 累加。
+    返回 (秒数, 首次进入CHARGING时间, 最后离开CHARGING时间)。
+    """
+    seq = _gun_status_sequence(gun_events, gun or "")
+    if not seq and gun in (None, "", "-"):
+        # 未指定枪号时，用全部事件压缩（多枪场景可能混杂，仅作兜底）
+        seq = []
+        for ts, _g, st in gun_events:
+            if not seq or seq[-1][1] != st:
+                seq.append((ts, st))
+
+    total = 0.0
+    charging_since: datetime | None = None
+    first_charge: str | None = None
+    last_leave: str | None = None
+    for ts, st in seq:
+        t = _parse_event_ts(ts)
+        if t is None:
+            continue
+        if st == "CHARGING":
+            if charging_since is None:
+                charging_since = t
+                if first_charge is None:
+                    first_charge = ts[:19] if ts else None
+        else:
+            if charging_since is not None:
+                total += max(0.0, (t - charging_since).total_seconds())
+                last_leave = ts[:19] if ts else last_leave
+                charging_since = None
+    # 若日志截断时仍停在 CHARGING，不计开放区间（避免虚高）
+    if total <= 0:
+        return None, first_charge, last_leave
+    return int(round(total)), first_charge, last_leave
 
 
 def _fmt_duration(seconds: Any) -> str:
@@ -2398,8 +2460,16 @@ def analyze_order_log(
     if end_time == "-" and charge_end_ts:
         end_time = charge_end_ts[:19]
 
-    # 时长：优先 chargeDuration，否则用起止时间差
-    if duration in (None, "", "-", 0, "0"):
+    # 时长：优先按枪口 CHARGING 时段累计（OCCUPYING 等不算充电）；
+    # 其次平台 chargeDuration；最后用订单起止时间差。
+    charge_dur, charge_first, charge_last = _charging_duration_from_gun_events(gun_events, gun)
+    if charge_dur is not None and charge_dur > 0:
+        duration = charge_dur
+        if charge_first:
+            charge_start_ts = charge_first
+        if charge_last:
+            charge_end_ts = charge_last
+    elif duration in (None, "", "-", 0, "0"):
         duration = _duration_seconds(
             start_time if start_time != "-" else None,
             end_time if end_time != "-" else None,
