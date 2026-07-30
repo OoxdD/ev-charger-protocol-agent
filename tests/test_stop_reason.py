@@ -49,6 +49,32 @@ def test_remote_stop_without_reason_is_user_remote_stop():
     assert r["extras"]["stop_reason"] == fields["停止原因"]
 
 
+def test_power_nonzero_energy_zero_platform_guard_stop():
+    """有功率但电量为0，平台写出中文异常并下发停止 → 直接输出该异常原因。"""
+    text = "\n".join(
+        [
+            '2026-07-30 18:28:43 [x] RemoteCmd>>>>>>>>:{"remoteCmd":"17","deviceNo":"P1","interfaceCode":"1","data":{"serviceId":"511","interfaceCode":"1"}}',
+            "2026-07-30 18:28:44 [x] 远程启动充电响应，成功",
+            "2026-07-30 18:28:45 [x] 1枪:CHARGING",
+            '2026-07-30 18:29:29 [x] --socInfo:{"serviceId":511,"interfaceCode":"1","batteryChargerOutPower":39872,"batteryChargerOutputCurrent":101200,"batteryChargerOutputVoltage":394500,"tradeNo":"T1"}',
+            '2026-07-30 18:29:29 [x] --chargingInfo:{"serviceId":511,"interfaceCode":"1","tradeNo":"T1","totalBattery":0,"chargeMoney":0}',
+            "2026-07-30 18:31:14 [x] 设备充电功率不为零，电量为0，停止充电，511",
+            '2026-07-30 18:31:16 [x] RemoteCmd>>>>>>>>:{"remoteCmd":"18","deviceNo":"P1","interfaceCode":"1","data":{"serviceId":511,"interfaceCode":"1","chargeFinishReason":99}}',
+            "2026-07-30 18:31:16 [x] 远程停止充电响应，成功",
+            '2026-07-30 18:31:20 [x] --recordInfo:{"serviceId":511,"interfaceCode":"1","tradeNo":"T1","totalBattery":0,"chargeMoney":0,"deviceChargeFinishReasonMsg":"结束充电，APP远程停止","deviceChargeFinishReasonCode":6}',
+            "2026-07-30 18:31:21 [x] 1枪:IDLE",
+        ]
+    )
+    r = analyze_order_log(text, service_id="511")
+    fields = {f["name"]: f["value"] for f in r["fields"]}
+    assert r["extras"]["stop_category"] == "platform_guard_stop"
+    assert fields["停止类型"] == "平台异常停止"
+    assert fields["停止原因"] == "设备充电功率不为零，电量为0，停止充电"
+    assert "设备充电功率不为零，电量为0，停止充电" in fields["平台停止原因"]
+    assert "用户远程停止" not in fields["停止类型"]
+    assert "设备充电功率不为零，电量为0，停止充电" in (r.get("verdict") or "")
+
+
 def test_device_unplug_ready_charge():
     text = "\n".join(
         [

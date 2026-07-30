@@ -621,6 +621,22 @@ def _is_specific_remote_stop_reason(msg: str | None) -> bool:
     return True
 
 
+# 平台侧守护/校验触发停止的中文异常（常无 stopReasonMsg，但日志有明确文案）
+_PLATFORM_GUARD_STOP_PATTERNS = (
+    re.compile(r"(设备充电功率不为零[，,]\s*电量为\s*0[，,]\s*停止充电)"),
+    re.compile(r"(设备充电功率不为零[^，\n]{0,20}电量为\s*0[^，\n]{0,10}停止充电)"),
+)
+
+
+def _extract_platform_guard_stop_msg(ln: str) -> str | None:
+    """从日志行提取平台守护停止的中文异常原因。"""
+    for pat in _PLATFORM_GUARD_STOP_PATTERNS:
+        m = pat.search(ln)
+        if m:
+            return re.sub(r"\s+", "", m.group(1).replace(",", "，"))
+    return None
+
+
 def _gun_status_sequence(
     gun_events: list[tuple[str, str, str]],
     gun: str,
@@ -737,6 +753,7 @@ def _analyze_stop(
     gun: str,
     offline_reconnect: bool = False,
     alarm_notes: list[str] | None = None,
+    platform_guard_msg: str | None = None,
 ) -> dict[str, Any]:
     """区分平台远程停止 / 离线重连 / 设备跳枪 / 直接拔枪 / 枪口故障 / 疑似急停。
 
@@ -744,6 +761,7 @@ def _analyze_stop(
     """
     finish = (finish_msg or "").strip() if finish_msg and finish_msg != "-" else ""
     platform_msg = (remote_stop_msg or "").strip() if remote_stop_msg else ""
+    guard_msg = (platform_guard_msg or "").strip() if platform_guard_msg else ""
     has_alarms = bool(alarm_notes)
     alarm_summary = "；".join((alarm_notes or [])[:3]) if has_alarms else ""
     seq = _gun_status_sequence(gun_events, gun)
@@ -800,6 +818,18 @@ def _analyze_stop(
     first_after = after_charge[0][1] if after_charge else None
 
     if has_remote_stop:
+        # 平台守护异常（如功率不为零但电量为0）优先于「无原因→用户停止」
+        if guard_msg and not _is_specific_remote_stop_reason(platform_msg):
+            return {
+                "category": "platform_guard_stop",
+                "stop_type": "平台异常停止",
+                "reason": guard_msg,
+                "platform_stop_reason": guard_msg,
+                "device_finish_reason": finish or "-",
+                "gun_transition": first_after or "-",
+                "tip": "",
+                "evidence": f"平台检测到异常并下发远程停止：{guard_msg}",
+            }
         # 有具体 stopReasonMsg → 按平台文案；无具体原因 → 一般是用户远程停止
         if _is_specific_remote_stop_reason(platform_msg):
             return {
@@ -971,8 +1001,10 @@ def _section(title: str) -> list[str]:
 
 def _norm_id(v: Any) -> str:
     """流水号常为左侧补 0 的 serviceId，比较时去掉前导 0。"""
+    if v is None:
+        return ""
     s = str(v).strip()
-    if not s:
+    if not s or s.lower() == "none":
         return ""
     if s.isdigit():
         return str(int(s))  # 0000000080321060 -> 80321060
@@ -1978,6 +2010,7 @@ def analyze_order_log(
     fault = False
     fault_notes: list[str] = []
     alarm_notes: list[str] = []
+    platform_guard_msg: str | None = None
     start_result_msgs: list[str] = []
     other_gun_notes: list[str] = []
     matched_guns: set[str] = set()
@@ -2102,6 +2135,15 @@ def analyze_order_log(
             # 告警多为桩级事件（常无 serviceId），整段日志内出现即收录
             if alarm_note not in alarm_notes:
                 alarm_notes.append(alarm_note)
+        # 平台守护停止中文异常（功率不为零电量为0等）
+        if related:
+            guard = _extract_platform_guard_stop_msg(ln)
+            if guard:
+                platform_guard_msg = platform_guard_msg or guard
+                ts = ts_m.group(1) if (ts_m := _TS.match(ln.strip())) else ""
+                note = f"{ts + '　' if ts else ''}{guard}"
+                if note not in fault_notes:
+                    fault_notes.append(note)
         # 中文启动结果（启动失败/成功）常无 serviceId，按桩级事件收录并原样输出
         start_phrase = _extract_start_result_phrase(ln)
         if start_phrase and start_phrase not in start_result_msgs:
@@ -2426,6 +2468,7 @@ def analyze_order_log(
         gun=gun,
         offline_reconnect=offline,
         alarm_notes=alarm_notes,
+        platform_guard_msg=platform_guard_msg,
     )
     # 急停/故障类在结论里需要提示确认
     need_user_confirm = stop_info["category"] in {"estop_suspect", "gun_fault"}
@@ -2824,6 +2867,10 @@ def analyze_order_log(
                 steps.append(
                     f"{n}. {_cn_datetime(end_time)}　用户远程停止充电（平台未下发具体停止原因）并完成结算。"
                 )
+            elif stop_info["category"] == "platform_guard_stop":
+                steps.append(
+                    f"{n}. {_cn_datetime(end_time)}　平台异常停止：{stop_info['reason']}，并完成结算。"
+                )
             else:
                 steps.append(
                     f"{n}. {_cn_datetime(end_time)}　平台下发远程停止"
@@ -2893,6 +2940,8 @@ def analyze_order_log(
         "offline_gun_fault",
     }:
         out.append(f"本订单为「{stop_info['stop_type']}」结束的充电订单。")
+    elif stop_info["category"] == "platform_guard_stop":
+        out.append(f"本订单为「平台异常停止」：{stop_info['reason']}。")
     elif energy_mismatch or start_mismatch:
         out.append("本订单已提取完毕，但启动或过程电量校验存在差异，需重点复核。")
     elif has_remote_stop:
@@ -2932,6 +2981,8 @@ def analyze_order_log(
     elif has_remote_stop:
         if stop_info["category"] == "user_remote_stop":
             msg = "2. 平台下发远程停止，但无具体停止原因，一般判定为用户远程停止充电。"
+        elif stop_info["category"] == "platform_guard_stop":
+            msg = f"2. 平台异常停止：{stop_info['reason']}。"
         else:
             msg = f"2. 平台下发远程停止，停止原因：{stop_info['reason']}。"
         if offline:
@@ -3023,6 +3074,11 @@ def analyze_order_log(
         out.append(f"综合判断：{start_result_txt}，启动未成功，原因明确，无需复核。")
         valid = True
         verdict = f"综合判断：{start_result_txt}，启动未成功，原因明确，无需复核。"
+    elif stop_info["category"] == "platform_guard_stop":
+        # 平台已给出明确异常文案（如功率不为零电量为0），直接输出，不淹没在电量校验里
+        out.append(f"综合判断：平台异常停止——{stop_info['reason']}。")
+        valid = True
+        verdict = f"综合判断：平台异常停止——{stop_info['reason']}。"
     elif energy_mismatch or start_mismatch:
         reasons = []
         if start_mismatch:
@@ -3267,6 +3323,7 @@ def analyze_order_log(
                 in {
                     "remote_stop",
                     "user_remote_stop",
+                    "platform_guard_stop",
                     "device_finish",
                     "device_unplug",
                     "device_occupy",

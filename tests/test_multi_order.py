@@ -49,3 +49,23 @@ def test_build_multi_order_choice_shape():
     assert r["mode"] == "multi_order_choice"
     assert r["extras"]["need_order_filter"] is True
     assert len(r["extras"]["orders"]) == 2
+
+
+def test_remote_starts_without_trade_no_not_merged():
+    """RemoteCmd 常无 tradeNo；不得因 _norm_id(None)=='None' 把多单并成一单。"""
+    text = "\n".join(
+        [
+            '>>>>>>>>RemoteCmd>>>>>>>>:{"remoteCmd":"17","deviceNo":"P1","interfaceCode":"1","data":{"serviceId":111}}',
+            '>>>>>>>>RemoteCmd>>>>>>>>:{"remoteCmd":"17","deviceNo":"P1","interfaceCode":"2","data":{"serviceId":222}}',
+            '--chargingInfo:{"deviceNo":"P1","interfaceCode":"1","serviceId":111,"tradeNo":"T111","totalBattery":1000,"chargeMoney":100}',
+            '--chargingInfo:{"deviceNo":"P1","interfaceCode":"2","serviceId":222,"tradeNo":"T222","totalBattery":2000,"chargeMoney":200}',
+            '--recordInfo:{"deviceNo":"P1","interfaceCode":"1","serviceId":111,"tradeNo":"T111","totalBattery":1000,"chargeMoney":100}',
+            '--recordInfo:{"deviceNo":"P1","interfaceCode":"2","serviceId":222,"tradeNo":"T222","totalBattery":2000,"chargeMoney":200}',
+        ]
+    )
+    orders = _discover_orders(text)
+    assert len(orders) == 2
+    assert {o["service_id"] for o in orders} == {"111", "222"}
+    choice = analyze_order_log(text)
+    assert choice["mode"] == "multi_order_choice"
+    assert choice["extras"]["order_count"] == 2
