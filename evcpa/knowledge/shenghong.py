@@ -83,10 +83,53 @@ SH_STOP_STRATEGY: dict[int, str] = {
     3: "按电量充满",
 }
 
+# CMD=5 控制命令地址（表 3_1_9，常用项）
+SH_CTRL_ADDR: dict[int, str] = {
+    1: "预留",
+    2: "停止充电",
+    3: "预留",
+    4: "充电控制方式",
+    10: "取消预约充电",
+    11: "设备重启",
+    12: "进入升级模式",
+    13: "进入正常应用模式",
+    14: "立即上报签到",
+    15: "立即上报状态",
+    16: "扫描支付成功",
+    17: "限制最大充电功率",
+    23: "充电暂停服务",
+}
+
+# 设备结束原因中表示后台/平台远程停止的编码
+SH_REMOTE_STOP_REASON_CODES = frozenset({311, 101006})
+
 SH_CAR_LINK: dict[int, str] = {
     0: "断开",
     1: "半连接",
     2: "连接",
+}
+
+# 附录 2 停止原因（常用 + 交流扩展码）
+SH_STOP_REASON: dict[int, str] = {
+    0: "正常结束",
+    200: "用户中止",
+    300: "CC1 连接断开",
+    301: "用户刷卡停止",
+    302: "紧急停机",
+    306: "充电电量达到设定值",
+    307: "充电时间达到设定值",
+    308: "充电金额达到设定值",
+    311: "后台终止",
+    101005: "用户刷卡停止充电",
+    101006: "后台停止",
+    101007: "充电时间达到设定值",
+    101008: "充电金额达到设定值",
+    101009: "充电电量达到设定值",
+    101012: "未知原因",
+    101013: "用户界面中止",
+    101014: "金额不足",
+    101015: "电池充满",
+    101016: "达到用户设定充电条件停止",
 }
 
 # CMD104 主体字段（跳过前 4 字节预留后从桩编码开始）；单位按协议比例
@@ -167,6 +210,25 @@ SH_CMD202_FIELDS: list[tuple[str, int, str]] = [
     ("session_energy", 4, "energy01"),
     ("meter_before", 4, "energy01"),
     ("meter_after", 4, "energy01"),
+    ("session_money", 4, "money"),
+    ("internal_index", 4, "u32"),
+]
+
+# CMD 222：布局同 202，电量/表码分辨率为 0.001 kWh
+SH_CMD222_FIELDS: list[tuple[str, int, str]] = [
+    ("pile_code", 32, "ascii"),
+    ("gun_pos_type", 1, "u8"),
+    ("gun_no", 1, "u8"),
+    ("card_no", 32, "ascii"),
+    ("start_time", 8, "bcd_time"),
+    ("end_time", 8, "bcd_time"),
+    ("duration_sec", 4, "u32"),
+    ("soc_start", 1, "u8"),
+    ("soc_end", 1, "u8"),
+    ("stop_reason", 4, "u32"),
+    ("session_energy", 4, "energy001"),
+    ("meter_before", 4, "energy001"),
+    ("meter_after", 4, "energy001"),
     ("session_money", 4, "money"),
     ("internal_index", 4, "u32"),
 ]

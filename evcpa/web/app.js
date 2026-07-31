@@ -289,23 +289,28 @@
         ? data.verdict || "该报文有多个订单，请选择并输入服务ID再进行解析"
         : withDeviceFollowup(data.verdict || "", data);
 
-      const pick = (name) => {
-        const f = (data.fields || []).find((x) => x.name === name);
-        return f ? f.value : "-";
+      const pick = (...names) => {
+        for (const name of names) {
+          const f = (data.fields || []).find((x) => x.name === name);
+          if (f != null && f.value != null && String(f.value) !== "" && String(f.value) !== "-") {
+            return f.value;
+          }
+        }
+        return "-";
       };
       if (isChoice) {
         summaryGrid.innerHTML = [
           card("订单笔数", pick("订单笔数")),
-          card("充电桩", pick("充电桩编号")),
+          card("充电桩", pick("充电桩编号", "充电桩编码", "设备编号")),
           card("状态", "需选择订单", "bad"),
         ].join("");
       } else if (isCharge) {
         summaryGrid.innerHTML = [
-          card("充电桩", pick("充电桩编号")),
-          card("枪口", pick("枪口号")),
-          card("充电电量", pick("实际充电电量")),
-          card("费用合计", pick("费用合计")),
-          card("结束原因", pick("设备结束原因")),
+          card("充电桩", pick("充电桩编号", "充电桩编码", "设备编号")),
+          card("枪口", pick("枪口号", "枪号")),
+          card("充电电量", pick("实际充电电量", "总电量")),
+          card("费用合计", pick("费用合计", "充电总费用")),
+          card("结束原因", pick("设备结束原因", "停止原因", "结束原因")),
           card("状态", data.valid !== false ? "正常" : "需复核", data.valid !== false ? "ok" : "bad"),
         ].join("");
       } else {
@@ -761,6 +766,7 @@
           "启动时间",
           "结束时间",
           "充电时长",
+          "SOC",
           "启动时账户余额",
         ],
       },

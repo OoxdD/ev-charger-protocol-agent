@@ -6,6 +6,7 @@ from typing import Any
 from evcpa.detect import detect_best
 from evcpa.frame_order import aggregate_frame_order, has_order_signal
 from evcpa.csg_session import aggregate_csg_session
+from evcpa.shenghong_session import aggregate_shenghong_session
 from evcpa.framing import split_frames
 from evcpa.models import AnalysisResult, ProtocolId, WarningItem
 from evcpa.protocol_log import extract_frames_from_protocol_log, looks_like_protocol_trace_log
@@ -282,6 +283,20 @@ class ProtocolAgent:
             }
             return report
 
+        sh_n = sum(1 for r in detail_results if r.protocol.value == "shenghong")
+        if sh_n >= max(3, len(detail_results) // 2):
+            report = aggregate_shenghong_session(
+                detail_results,
+                meta={"pile": pile, "source": "protocol_trace_log"},
+            )
+            report["extras"] = {
+                **(report.get("extras") or {}),
+                "source": "protocol_trace_log",
+                "extracted_frames": len(log_frames),
+                "link_placeholder": skipped_link,
+            }
+            return report
+
         if has_order_signal(results):
             report = aggregate_frame_order(
                 results,
@@ -344,6 +359,14 @@ class ProtocolAgent:
             r.extras = {**(r.extras or {}), "frame_offset": fr.offset, "frame_len": len(fr.data)}
             results.append(r)
 
+        csg_n = sum(1 for r in results if r.protocol.value == "csg")
+        if csg_n >= max(3, len(results) // 2):
+            return aggregate_csg_session(results, meta={"source": "protocol_frames"})
+
+        sh_n = sum(1 for r in results if r.protocol.value == "shenghong")
+        if sh_n >= max(3, len(results) // 2):
+            return aggregate_shenghong_session(results, meta={"source": "protocol_frames"})
+
         if has_order_signal(results):
             report = aggregate_frame_order(
                 results, service_id=service_id, trade_no=trade_no
@@ -353,10 +376,6 @@ class ProtocolAgent:
                 "candidates": results[0].extras.get("candidates") if results else [],
             }
             return report
-
-        csg_n = sum(1 for r in results if r.protocol.value == "csg")
-        if csg_n >= max(3, len(results) // 2):
-            return aggregate_csg_session(results, meta={"source": "protocol_frames"})
 
         first = results[0]
         warnings: list[dict[str, Any]] = []

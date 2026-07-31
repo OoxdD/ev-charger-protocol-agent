@@ -625,6 +625,7 @@ def _is_specific_remote_stop_reason(msg: str | None) -> bool:
 _PLATFORM_GUARD_STOP_PATTERNS = (
     re.compile(r"(设备充电功率不为零[，,]\s*电量为\s*0[，,]\s*停止充电)"),
     re.compile(r"(设备充电功率不为零[^，\n]{0,20}电量为\s*0[^，\n]{0,10}停止充电)"),
+    re.compile(r"(设备充电电量增量一直为\s*0[，,]\s*停止充电)"),
 )
 
 
@@ -822,7 +823,7 @@ def _analyze_stop(
         if guard_msg and not _is_specific_remote_stop_reason(platform_msg):
             return {
                 "category": "platform_guard_stop",
-                "stop_type": "平台异常停止",
+                "stop_type": "平台停止",
                 "reason": guard_msg,
                 "platform_stop_reason": guard_msg,
                 "device_finish_reason": finish or "-",
@@ -934,7 +935,7 @@ def _analyze_stop(
     if first_after == "IDLE" or any(st == "IDLE" for _, st in after_charge[:3]):
         return {
             "category": "device_idle_unplug",
-            "stop_type": "设备跳枪停止（直接拔枪）",
+            "stop_type": "设备跳枪停止",
             "reason": finish or "充电过程中直接拔枪（枪口变为 IDLE）",
             "platform_stop_reason": "-",
             "device_finish_reason": finish or "-",
@@ -947,8 +948,8 @@ def _analyze_stop(
     if first_after == "OCCUPYING" or any(st == "OCCUPYING" for _, st in after_charge[:3]):
         return {
             "category": "device_occupy",
-            "stop_type": "设备跳枪停止（占桩）",
-            "reason": finish or "跳枪后进入占桩（OCCUPYING）",
+            "stop_type": "设备跳枪停止",
+            "reason": finish or "充电结束，枪口变为 OCCUPYING",
             "platform_stop_reason": "-",
             "device_finish_reason": finish or "-",
             "gun_transition": "CHARGING→OCCUPYING",
@@ -2869,7 +2870,7 @@ def analyze_order_log(
                 )
             elif stop_info["category"] == "platform_guard_stop":
                 steps.append(
-                    f"{n}. {_cn_datetime(end_time)}　平台异常停止：{stop_info['reason']}，并完成结算。"
+                    f"{n}. {_cn_datetime(end_time)}　平台停止：{stop_info['reason']}，并完成结算。"
                 )
             else:
                 steps.append(
@@ -2941,7 +2942,7 @@ def analyze_order_log(
     }:
         out.append(f"本订单为「{stop_info['stop_type']}」结束的充电订单。")
     elif stop_info["category"] == "platform_guard_stop":
-        out.append(f"本订单为「平台异常停止」：{stop_info['reason']}。")
+        out.append(f"本订单为「平台停止」：{stop_info['reason']}。")
     elif energy_mismatch or start_mismatch:
         out.append("本订单已提取完毕，但启动或过程电量校验存在差异，需重点复核。")
     elif has_remote_stop:
@@ -2982,7 +2983,7 @@ def analyze_order_log(
         if stop_info["category"] == "user_remote_stop":
             msg = "2. 平台下发远程停止，但无具体停止原因，一般判定为用户远程停止充电。"
         elif stop_info["category"] == "platform_guard_stop":
-            msg = f"2. 平台异常停止：{stop_info['reason']}。"
+            msg = f"2. 平台停止：{stop_info['reason']}。"
         else:
             msg = f"2. 平台下发远程停止，停止原因：{stop_info['reason']}。"
         if offline:
@@ -3076,9 +3077,9 @@ def analyze_order_log(
         verdict = f"综合判断：{start_result_txt}，启动未成功，原因明确，无需复核。"
     elif stop_info["category"] == "platform_guard_stop":
         # 平台已给出明确异常文案（如功率不为零电量为0），直接输出，不淹没在电量校验里
-        out.append(f"综合判断：平台异常停止——{stop_info['reason']}。")
+        out.append(f"综合判断：平台停止——{stop_info['reason']}。")
         valid = True
-        verdict = f"综合判断：平台异常停止——{stop_info['reason']}。"
+        verdict = f"综合判断：平台停止——{stop_info['reason']}。"
     elif energy_mismatch or start_mismatch:
         reasons = []
         if start_mismatch:

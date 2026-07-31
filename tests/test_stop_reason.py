@@ -68,11 +68,36 @@ def test_power_nonzero_energy_zero_platform_guard_stop():
     r = analyze_order_log(text, service_id="511")
     fields = {f["name"]: f["value"] for f in r["fields"]}
     assert r["extras"]["stop_category"] == "platform_guard_stop"
-    assert fields["停止类型"] == "平台异常停止"
+    assert fields["停止类型"] == "平台停止"
     assert fields["停止原因"] == "设备充电功率不为零，电量为0，停止充电"
     assert "设备充电功率不为零，电量为0，停止充电" in fields["平台停止原因"]
     assert "用户远程停止" not in fields["停止类型"]
     assert "设备充电功率不为零，电量为0，停止充电" in (r.get("verdict") or "")
+
+
+def test_energy_increment_zero_platform_guard_stop():
+    """盛弘 JSON：电量增量一直为0，平台写出原因并下发停止 → 直接输出该文案。"""
+    text = "\n".join(
+        [
+            '2026-07-28 08:28:33 [x] RemoteCmd>>>>>>>>:{"remoteCmd":"17","deviceNo":"4402202404140015","interfaceCode":"1","data":{"serviceId":509738145,"interfaceCode":"1"}}',
+            "2026-07-28 08:28:34 [x] 远程启动充电响应，成功",
+            "2026-07-28 08:28:35 [x] 1枪:CHARGING",
+            '2026-07-28 10:12:27 [x] 设备充电电量增量为0，serviceId:509738145  连续次数:2',
+            "2026-07-28 10:15:28 [x] 设备充电电量增量一直为0，停止充电，509738145",
+            '2026-07-28 10:15:29 [x] RemoteCmd>>>>>>>>:{"remoteCmd":"18","deviceNo":"4402202404140015","interfaceCode":"1","data":{"serviceId":509738145,"interfaceCode":"1"}}',
+            "2026-07-28 10:15:29 [x] 远程停止充电响应，成功",
+            '2026-07-28 10:15:40 [x] --recordInfo:{"serviceId":509738145,"interfaceCode":"1","tradeNo":"T1","totalBattery":2125,"chargeMoney":2125,"deviceChargeFinishReasonMsg":"后台停止","deviceChargeFinishReasonCode":311}',
+            "2026-07-28 10:15:41 [x] 1枪:IDLE",
+        ]
+    )
+    r = analyze_order_log(text, service_id="509738145")
+    fields = {f["name"]: f["value"] for f in r["fields"]}
+    assert r["extras"]["stop_category"] == "platform_guard_stop"
+    assert fields["停止类型"] == "平台停止"
+    assert fields["停止原因"] == "设备充电电量增量一直为0，停止充电"
+    assert fields["平台停止原因"] == "设备充电电量增量一直为0，停止充电"
+    assert "用户远程停止" not in fields["停止类型"]
+    assert "设备充电电量增量一直为0，停止充电" in (r.get("verdict") or "")
 
 
 def test_device_unplug_ready_charge():
@@ -335,7 +360,7 @@ def test_post_unplug_trouble_not_this_order():
     assert r["extras"].get("fault_notes") == []
     fields = {f["name"]: f["value"] for f in r["fields"]}
     assert fields.get("本单异常/告警摘录") == "无"
-    assert fields.get("停止类型") == "设备跳枪停止（直接拔枪）"
+    assert fields.get("停止类型") == "设备跳枪停止"
 
 
 def test_analyze_stop_ignores_post_unplug_trouble():

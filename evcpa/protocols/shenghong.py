@@ -6,18 +6,21 @@ from typing import Any
 
 from evcpa.knowledge.alarms import VENDOR_STATUS_MAP
 from evcpa.knowledge.shenghong import (
+    SH_CAR_LINK,
     SH_CHARGE_WAY,
     SH_CMD_NAMES,
     SH_CMD102_FIELDS,
     SH_CMD104_FIELDS,
     SH_CMD106_FIELDS,
     SH_CMD202_FIELDS,
+    SH_CMD222_FIELDS,
+    SH_CTRL_ADDR,
     SH_FIELD_LABELS,
     SH_GUN_TYPE,
     SH_PROTOCOL_VERSION,
+    SH_STOP_REASON,
     SH_STOP_STRATEGY,
     SH_WORK_STATUS,
-    SH_CAR_LINK,
 )
 from evcpa.models import AnalysisResult, FieldItem, ProtocolId, WarningItem
 from evcpa.protocols.base import ProtocolParser
@@ -80,6 +83,8 @@ def _decode_field(kind: str, raw: bytes) -> Any:
         return round(v * 0.1, 1)
     if kind == "energy01":
         return round(read_u32_le(raw, 0) * 0.01, 3)
+    if kind == "energy001":
+        return round(read_u32_le(raw, 0) * 0.001, 3)
     if kind == "money":
         return round(read_u32_le(raw, 0) * 0.01, 2)
     if kind == "power01":
@@ -104,7 +109,195 @@ def _meaning_for(name: str, value: Any) -> str | None:
         return SH_GUN_TYPE.get(value)
     if name == "encrypt_support" and isinstance(value, int):
         return "支持 AES 加密" if value == 1 else "不支持加密"
+    if name == "stop_reason" and isinstance(value, int):
+        return SH_STOP_REASON.get(value, f"停止码 {value}")
     return None
+
+
+_UNIT_BY_KIND = {
+    "money": "元",
+    "energy01": "kWh",
+    "energy001": "kWh",
+    "volt": "V",
+    "curr": "A",
+    "power01": "kW",
+}
+
+
+def _parse_cmd5_control(payload: bytes, *, base_offset: int) -> list[FieldItem]:
+    """解析 CMD=5 控制命令：枪口 + 起始命令地址 + 参数。"""
+    fields: list[FieldItem] = []
+    if len(payload) < 8:
+        fields.append(
+            FieldItem(
+                name="payload",
+                value=to_hex(payload),
+                offset=base_offset,
+                length=len(payload),
+                meaning="控制命令数据域过短",
+            )
+        )
+        return fields
+    gun = payload[0]
+    addr = read_u32_le(payload, 1)
+    count = payload[5]
+    param_len = read_u16_le(payload, 6)
+    fields.append(
+        FieldItem(name="gun_no", value=gun, offset=base_offset, length=1, label="枪号/枪序号", meaning="充电枪口")
+    )
+    fields.append(
+        FieldItem(
+            name="ctrl_addr",
+            value=addr,
+            offset=base_offset + 1,
+            length=4,
+            label="控制命令地址",
+            meaning=SH_CTRL_ADDR.get(addr, f"命令地址 {addr}"),
+        )
+    )
+    fields.append(
+        FieldItem(
+            name="ctrl_count",
+            value=count,
+            offset=base_offset + 5,
+            length=1,
+            label="命令个数",
+            meaning="本次下发命令个数",
+        )
+    )
+    fields.append(
+        FieldItem(
+            name="ctrl_param_len",
+            value=param_len,
+            offset=base_offset + 6,
+            length=2,
+            label="命令参数长度",
+            meaning="命令参数字节数",
+        )
+    )
+    params = payload[8 : 8 + param_len] if param_len else b""
+    if params:
+        param_val = read_u32_le(params, 0) if len(params) >= 4 else int.from_bytes(params, "little")
+        meaning = to_hex(params)
+        if addr == 2:
+            meaning = "有效（远程停止充电）" if param_val == 0x55 else f"停止参数 0x{param_val:X}"
+            fields.append(
+                FieldItem(
+                    name="is_remote_stop",
+                    value=param_val == 0x55,
+                    offset=base_offset + 8,
+                    length=min(4, len(params)),
+                    meaning="平台下发远程停止充电" if param_val == 0x55 else "停止充电参数非 0x55",
+                )
+            )
+        fields.append(
+            FieldItem(
+                name="ctrl_param",
+                value=param_val if len(params) >= 4 else to_hex(params),
+                offset=base_offset + 8,
+                length=len(params),
+                label="命令参数",
+                meaning=meaning,
+            )
+        )
+    rest = payload[8 + len(params) :]
+    if rest:
+        fields.append(
+            FieldItem(
+                name="payload_rest",
+                value=to_hex(rest),
+                offset=base_offset + 8 + len(params),
+                length=len(rest),
+                meaning="未映射载荷",
+            )
+        )
+    return fields
+
+
+def _parse_cmd6_control_ack(payload: bytes, *, base_offset: int) -> list[FieldItem]:
+    """解析 CMD=6 控制命令应答。"""
+    fields: list[FieldItem] = []
+    if len(payload) < 39:
+        fields.append(
+            FieldItem(
+                name="payload",
+                value=to_hex(payload),
+                offset=base_offset,
+                length=len(payload),
+                meaning="控制应答数据域过短",
+            )
+        )
+        return fields
+    pile = _ascii_z(payload[:32])
+    gun = payload[32]
+    addr = read_u32_le(payload, 33)
+    count = payload[37]
+    result = payload[38]
+    fields.append(
+        FieldItem(
+            name="pile_code",
+            value=pile or "-",
+            offset=base_offset,
+            length=32,
+            label="充电桩编码",
+            meaning="充电桩编码",
+        )
+    )
+    fields.append(
+        FieldItem(name="gun_no", value=gun, offset=base_offset + 32, length=1, label="枪号/枪序号", meaning="充电枪口")
+    )
+    fields.append(
+        FieldItem(
+            name="ctrl_addr",
+            value=addr,
+            offset=base_offset + 33,
+            length=4,
+            label="控制命令地址",
+            meaning=SH_CTRL_ADDR.get(addr, f"命令地址 {addr}"),
+        )
+    )
+    fields.append(
+        FieldItem(
+            name="ctrl_count",
+            value=count,
+            offset=base_offset + 37,
+            length=1,
+            label="命令个数",
+            meaning="命令个数",
+        )
+    )
+    fields.append(
+        FieldItem(
+            name="ctrl_result",
+            value=result,
+            offset=base_offset + 38,
+            length=1,
+            label="执行结果",
+            meaning="成功" if result == 0 else f"失败({result})",
+        )
+    )
+    if addr == 2:
+        fields.append(
+            FieldItem(
+                name="is_remote_stop",
+                value=True,
+                offset=base_offset + 33,
+                length=4,
+                meaning="桩应答远程停止充电控制",
+            )
+        )
+    rest = payload[39:]
+    if rest:
+        fields.append(
+            FieldItem(
+                name="payload_rest",
+                value=to_hex(rest),
+                offset=base_offset + 39,
+                length=len(rest),
+                meaning="未映射载荷",
+            )
+        )
+    return fields
 
 
 def _walk_fields(
@@ -125,21 +318,14 @@ def _walk_fields(
             continue
         label = SH_FIELD_LABELS.get(name, name)
         meaning = _meaning_for(name, val)
-        disp = f"{val} 元" if kind == "money" and isinstance(val, (int, float)) else val
-        if kind == "energy01" and isinstance(val, (int, float)):
-            disp = f"{val} kWh"
-        if kind == "volt" and isinstance(val, (int, float)):
-            disp = f"{val} V"
-        if kind == "curr" and isinstance(val, (int, float)):
-            disp = f"{val} A"
-        if kind == "power01" and isinstance(val, (int, float)):
-            disp = f"{val} kW"
         fields.append(
             FieldItem(
                 name=name,
-                value=disp,
+                value=val,
                 offset=base_offset + o - size,
                 length=size,
+                unit=_UNIT_BY_KIND.get(kind),
+                label=label,
                 meaning=meaning or label,
             )
         )
@@ -330,21 +516,20 @@ class ShenghongParser(ProtocolParser):
                 104: SH_CMD104_FIELDS,
                 106: SH_CMD106_FIELDS,
                 202: SH_CMD202_FIELDS,
-                222: SH_CMD202_FIELDS,
+                222: SH_CMD222_FIELDS,
             }.get(cmd)
-        elif cmd in (101, 103, 105) and len(data) >= 4:
+        elif cmd in (5, 6, 7, 8, 101, 103, 105) and len(data) >= 4:
             fields.append(FieldItem(name="reserved1", value=to_hex(data[0:2]), offset=data_off, length=2, meaning="预留"))
             fields.append(FieldItem(name="reserved2", value=to_hex(data[2:4]), offset=data_off + 2, length=2, meaning="预留"))
             payload = data[4:]
             payload_off = data_off + 4
 
         if layout:
-            # 222 电量分辨率为 0.001，在 walk 后对关键字段再标注
             fields.extend(_walk_fields(payload, layout, base_offset=payload_off))
-            if cmd == 222:
-                for f in fields:
-                    if f.name in {"session_energy", "meter_before", "meter_after"} and isinstance(f.value, str) and f.value.endswith("kWh"):
-                        f.meaning = (f.meaning or "") + "（222 分辨率 0.001kWh，当前按 0.01 展示仅供参考）"
+        elif cmd == 5 and payload:
+            fields.extend(_parse_cmd5_control(payload, base_offset=payload_off))
+        elif cmd == 6 and payload:
+            fields.extend(_parse_cmd6_control_ack(payload, base_offset=payload_off))
         elif payload:
             # 通用：尝试提取 32 字节 ASCII 桩号
             if len(payload) >= 32:
@@ -393,11 +578,16 @@ class ShenghongParser(ProtocolParser):
 
         pile = next((f.value for f in fields if f.name == "pile_code"), None)
         work = next((f for f in fields if f.name == "work_status"), None)
+        ctrl = next((f for f in fields if f.name == "ctrl_addr"), None)
         summary = f"盛弘 {cmd_name}，CMD={cmd}，{direction}"
         if pile and pile != "-":
             summary += f"，桩号={pile}"
         if work and work.meaning:
             summary += f"，状态={work.meaning}"
+        if ctrl and ctrl.meaning:
+            summary += f"，控制={ctrl.meaning}"
+        if any(f.name == "is_remote_stop" and f.value is True for f in fields):
+            summary += "（远程停止）"
 
         return AnalysisResult(
             protocol=self.protocol_id,
