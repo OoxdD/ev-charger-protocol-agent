@@ -46,9 +46,39 @@ _START_RESULT_CN = re.compile(
     r"(?:\]|\s)(启动(?:失败|成功)[，,:：]?[^\"\{\}\n\[\]]{0,80})"
 )
 
+# 盛弘等：【MsgHandler】远程启动结果返回 code:9 msg:充电启动超时
+_REMOTE_START_RESULT = re.compile(
+    r"远程启动结果返回\s*code\s*[:：]\s*(\d+)\s*msg\s*[:：]\s*([^\n\r]+)",
+    re.IGNORECASE,
+)
+
+
+def _extract_remote_start_result_phrase(ln: str) -> str | None:
+    """解析「远程启动结果返回 code/msg」→ 启动失败/成功文案。"""
+    m = _REMOTE_START_RESULT.search(ln)
+    if not m:
+        return None
+    code = int(m.group(1))
+    msg = m.group(2).strip()
+    msg = re.split(r"\s*[,，]\s*serviceId\s*:", msg, maxsplit=1)[0]
+    msg = re.split(r"\s+nid\s*:", msg, maxsplit=1)[0]
+    # 去掉尾部纯数字服务号等附属
+    msg = re.sub(r"\s*[,，]?\s*\d{6,}\s*$", "", msg).strip(" 。.;；,，")
+    if code == 0:
+        if not msg or msg in {"成功", "OK", "ok", "success"}:
+            return "启动成功"
+        return f"启动成功，{msg}"
+    # 非 0：明确启动失败；有平台 msg 则附带（如充电启动超时）
+    if msg:
+        return f"启动失败，{msg}"
+    return "启动失败"
+
 
 def _extract_start_result_phrase(ln: str) -> str | None:
     """提取日志中的中文启动结果文案；无则返回 None。"""
+    remote_phrase = _extract_remote_start_result_phrase(ln)
+    if remote_phrase:
+        return remote_phrase
     if "启动失败" not in ln and "启动成功" not in ln:
         return None
     # 跳过纯 JSON 字段内嵌（如 stopReasonMsg），只取日志行可见文案
@@ -1062,6 +1092,27 @@ def _order_key_of(obj: dict[str, Any] | None) -> tuple[str, str]:
     return (sid, tn)
 
 
+def _remote_start_service_ids(text: str) -> set[str]:
+    """日志中远程启动指令（remoteCmd=17 等）对应的服务ID/流水号集合。"""
+    ids: set[str] = set()
+    for ln in text.splitlines():
+        m = _REMOTE_CMD.search(ln)
+        if not m:
+            continue
+        obj = _load_json(m.group(1))
+        if not obj:
+            continue
+        cmd = _remote_cmd_str(obj)
+        if cmd not in _REMOTE_START_CMDS:
+            continue
+        sid, tn = _order_key_of(obj)
+        for v in (sid, tn):
+            n = _norm_id(v)
+            if n:
+                ids.add(n)
+    return ids
+
+
 def _discover_orders(text: str) -> list[dict[str, Any]]:
     """从平台日志扫描出多笔订单的服务ID/流水号（用于多枪提示）。"""
     items: list[dict[str, Any]] = []
@@ -1516,22 +1567,9 @@ def _check_start_success(
         evidence.append("有电量过程上报")
 
     has_process = has_vi or has_energy
-    if has_process:
-        ok = True
-        msg = "启动成功：" + "；".join(evidence)
-        code = "START_OK"
-        return {
-            "ok": ok,
-            "code": code,
-            "message": msg,
-            "evidence": evidence,
-            "problems": problems,
-            "start_result": ok_msgs[0] if ok_msgs else "启动成功",
-        }
 
-    # 无过程数据：优先直接输出日志中文启动失败结果
+    # 日志已有明确启动失败文案（含「远程启动结果返回 code≠0」）时直接输出，不因短暂 CHARGING 误判成功
     if fail_msgs:
-        # 去重保序
         uniq: list[str] = []
         for m in fail_msgs:
             if m not in uniq:
@@ -1544,6 +1582,19 @@ def _check_start_success(
             "evidence": evidence,
             "problems": uniq,
             "start_result": msg,
+        }
+
+    if has_process:
+        ok = True
+        msg = "启动成功：" + "；".join(evidence)
+        code = "START_OK"
+        return {
+            "ok": ok,
+            "code": code,
+            "message": msg,
+            "evidence": evidence,
+            "problems": problems,
+            "start_result": ok_msgs[0] if ok_msgs else "启动成功",
         }
 
     if not has_ack:
@@ -1985,13 +2036,27 @@ def analyze_order_log(
     if not sid:
         discovered = _discover_orders(text)
         if len(discovered) > 1:
-            pile = next((o.get("pile") for o in discovered if o.get("pile")), None)
-            return build_multi_order_choice(
-                discovered,
-                protocol="order_log",
-                protocol_name="充电订单日志",
-                pile=pile,
-            )
+            # 仅一笔带远程启动指令时，自动锁定该单（另一枪过程上报常造成“假多单”）
+            start_sids = _remote_start_service_ids(text)
+            focused = [
+                o
+                for o in discovered
+                if _norm_id(o.get("service_id")) in start_sids
+                or _norm_id(o.get("trade_no")) in start_sids
+            ]
+            if len(focused) == 1:
+                sid = combine_filter(
+                    str(focused[0].get("service_id") or "") or None,
+                    str(focused[0].get("trade_no") or "") or None,
+                )
+            if not sid:
+                pile = next((o.get("pile") for o in discovered if o.get("pile")), None)
+                return build_multi_order_choice(
+                    discovered,
+                    protocol="order_log",
+                    protocol_name="充电订单日志",
+                    pile=pile,
+                )
 
     lines = text.splitlines()
     remote = None
@@ -2954,7 +3019,12 @@ def analyze_order_log(
         out.append("本订单充电数据已提取完毕，请结合下列要点复核。")
     out.append("")
     bullets = []
-    if start_mismatch:
+    if start_fail_explicit:
+        bullets.append(f"1. {start_result_txt}。")
+        fin = stop_info.get("device_finish_reason") or finish_msg or "-"
+        if fin and fin != "-":
+            bullets.append(f"2. 启动未成功，未形成有效充电；设备结束原因：{fin}。")
+    elif start_mismatch:
         bullets.append(f"1. {start_check.get('message')}")
     elif is_card_start:
         bullets.append(
@@ -2976,7 +3046,9 @@ def analyze_order_log(
         )
     else:
         bullets.append(f"1. {start_check.get('message')}")
-    if energy_mismatch:
+    if start_fail_explicit:
+        pass  # 启动失败场景不再展开跳枪/远程停止叙事
+    elif energy_mismatch:
         bad = [c["message"] for c in energy_checks if not c.get("ok")]
         bullets.append("2. 过程电量/账单校验异常：" + ("；".join(bad[:3]) if bad else "电量或分时不一致。"))
     elif has_remote_stop:
@@ -3029,34 +3101,35 @@ def analyze_order_log(
             detail_parts.append("告警：" + "；".join(alarm_notes[:3]))
         detail = "；".join(detail_parts) if detail_parts else "存在故障/告警关键字"
         bullets.append(f"2. 日志异常：{detail}。建议人工复核。")
-    if stop_info.get("reason") and stop_info["reason"] != "-":
-        fee_txt = (
-            _fmt_money((charge_money or 0) + (service_money or 0) + (parking_money or 0), money_scale)
-            if charge_money is not None
-            else "-"
-        )
-        if stop_info["device_finish_reason"] == "金额截止":
-            bullets.append(
-                f"3. 订单因账户余额用尽（金额截止）结束，费用合计约 {fee_txt}"
-                + ("，与启动余额一致。" if balance_disp != "-" else "。")
+    if not start_fail_explicit:
+        if stop_info.get("reason") and stop_info["reason"] != "-":
+            fee_txt = (
+                _fmt_money((charge_money or 0) + (service_money or 0) + (parking_money or 0), money_scale)
+                if charge_money is not None
+                else "-"
             )
+            if stop_info["device_finish_reason"] == "金额截止":
+                bullets.append(
+                    f"3. 订单因账户余额用尽（金额截止）结束，费用合计约 {fee_txt}"
+                    + ("，与启动余额一致。" if balance_disp != "-" else "。")
+                )
+            else:
+                bullets.append(
+                    f"3. 停止类型「{stop_info['stop_type']}」，原因：{stop_info['reason']}；费用合计约 {fee_txt}。"
+                )
         else:
-            bullets.append(
-                f"3. 停止类型「{stop_info['stop_type']}」，原因：{stop_info['reason']}；费用合计约 {fee_txt}。"
-            )
-    else:
-        bullets.append("3. 已输出费用与停止相关字段。")
-    bullets.append(f"4. {'未产生占桩计费，占桩费用为 0 元。' if not has_occupy else '存在占桩计费，详见费用明细。'}")
-    if total_kwh is not None:
-        only_ping = (jian in (0, None)) and (feng in (0, None)) and (gu in (0, None)) and bool(ping)
-        if only_ping:
-            bullets.append(f"5. 分时电量均归集在平段；实际充电量以表计 {total_kwh:.3f} kwh 为准。")
-        else:
-            bullets.append(f"5. 分时电量以结算字段为准；实际充电量以表计 {total_kwh:.3f} kwh 为准。")
-    if energy_mismatch:
-        bullets.append("6. 过程电量/账单校验：发现不一致，详见“四、过程与账单校验”。")
-    if start_mismatch:
-        bullets.append(f"{len(bullets) + 1}. 启动校验未通过，详见启动校验说明。")
+            bullets.append("3. 已输出费用与停止相关字段。")
+        bullets.append(f"4. {'未产生占桩计费，占桩费用为 0 元。' if not has_occupy else '存在占桩计费，详见费用明细。'}")
+        if total_kwh is not None:
+            only_ping = (jian in (0, None)) and (feng in (0, None)) and (gu in (0, None)) and bool(ping)
+            if only_ping:
+                bullets.append(f"5. 分时电量均归集在平段；实际充电量以表计 {total_kwh:.3f} kwh 为准。")
+            else:
+                bullets.append(f"5. 分时电量以结算字段为准；实际充电量以表计 {total_kwh:.3f} kwh 为准。")
+        if energy_mismatch:
+            bullets.append("6. 过程电量/账单校验：发现不一致，详见“四、过程与账单校验”。")
+        if start_mismatch:
+            bullets.append(f"{len(bullets) + 1}. 启动校验未通过，详见启动校验说明。")
     if need_user_confirm and stop_info.get("tip"):
         bullets.append(f"{len(bullets) + 1}. {stop_info['tip']}")
     if offline and not any("需到设备上核实充电数据" in b for b in bullets):
