@@ -68,7 +68,20 @@ evcpa serve --host 0.0.0.0 --port 6894
 # 接口: http://127.0.0.1:6894/docs
 # 页面支持「从设备拉取历史报文」→ 展示 → 人工点「开始分析」
 # 可选环境变量：EVCPA_HISTORY_LOGS_URL、EVCPA_HISTORY_LOGS_SKEY
+
+# Web 登录（可选；未设 EVCPA_AUTH_SECRET 时不鉴权，便于本地开发）
+# EVCPA_AUTH_SECRET=随机长串
+# EVCPA_AUTH_USERS=admin:pass123,ops:ops456
+# EVCPA_AUTH_TTL_HOURS=72
 ```
+
+| 变量 | 含义 | 示例 |
+|------|------|------|
+| `EVCPA_AUTH_USERS` | 账号:密码，多组用逗号/分号分隔 | `admin:pass123,ops:ops456` |
+| `EVCPA_AUTH_SECRET` | Cookie 签名密钥；**设置后启用登录门禁** | 随机长串 |
+| `EVCPA_AUTH_TTL_HOURS` | 会话有效期（小时），默认 72 | `72` |
+
+设置 `EVCPA_AUTH_SECRET` 与用户后，打开页面需登录；业务接口 `/analyze`、`/history-logs`、`/protocols` 需已登录 Cookie。CLI（`evcpa analyze` 等）不受影响。
 
 ### Python API
 

@@ -3,12 +3,20 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from evcpa.agent import ProtocolAgent
+from evcpa.auth import (
+    OptionalUser,
+    RequireUser,
+    auth_enabled,
+    clear_session_cookie,
+    set_session_cookie,
+    verify_password,
+)
 from evcpa.history_logs import fetch_device_history_logs, logs_to_text
 from evcpa.order_report import analyze_order_log, looks_like_order_log
 
@@ -45,6 +53,11 @@ class HistoryLogsRequest(BaseModel):
     limit_count: Optional[int] = Field(1000, description="最大条数，默认1000，最长15000")
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(
@@ -58,13 +71,42 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/me")
+def me(user: OptionalUser) -> dict[str, Any]:
+    enabled = auth_enabled()
+    if not enabled:
+        return {"authenticated": True, "username": None, "auth_enabled": False}
+    return {
+        "authenticated": bool(user),
+        "username": user,
+        "auth_enabled": True,
+    }
+
+
+@app.post("/api/login")
+def login(req: LoginRequest, response: Response) -> dict[str, Any]:
+    if not auth_enabled():
+        return {"ok": True, "auth_enabled": False, "username": None}
+    username = req.username.strip()
+    if not verify_password(username, req.password):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    set_session_cookie(response, username)
+    return {"ok": True, "auth_enabled": True, "username": username}
+
+
+@app.post("/api/logout")
+def logout(response: Response) -> dict[str, bool]:
+    clear_session_cookie(response)
+    return {"ok": True}
+
+
 @app.get("/protocols")
-def protocols() -> list[dict[str, str]]:
+def protocols(_user: RequireUser) -> list[dict[str, str]]:
     return agent.list_protocols()
 
 
 @app.post("/history-logs")
-def history_logs(req: HistoryLogsRequest) -> dict[str, Any]:
+def history_logs(req: HistoryLogsRequest, _user: RequireUser) -> dict[str, Any]:
     """代理拉取设备历史报文，拼成文本供页面展示；不自动分析。"""
     try:
         remote = fetch_device_history_logs(
@@ -99,7 +141,7 @@ def history_logs(req: HistoryLogsRequest) -> dict[str, Any]:
 
 
 @app.post("/analyze")
-def analyze(req: AnalyzeRequest) -> dict[str, Any]:
+def analyze(req: AnalyzeRequest, _user: RequireUser) -> dict[str, Any]:
     # 优先：运营平台订单日志 → 输出充电业务数据
     blob = req.text
     if not blob and req.hex and looks_like_order_log(req.hex):

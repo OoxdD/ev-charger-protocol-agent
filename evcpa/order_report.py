@@ -259,6 +259,18 @@ _OFFLINE_LOG_MARKERS = (
     "设备重复登录",
     "告警恢复：恢复上线",
 )
+# 下线 / 上线（用于短时离线重连判定）
+_OFFLINE_DOWN_MARKERS = (
+    "桩已离线",
+    "设备离线",
+    "ReadTimeout",
+)
+_OFFLINE_UP_MARKERS = (
+    "恢复上线",
+    "设备重复登录",
+    "告警恢复：恢复上线",
+    "设备登录",
+)
 _OFFLINE_FINISH_HINTS = (
     "掉电",
     "离线",
@@ -267,6 +279,239 @@ _OFFLINE_FINISH_HINTS = (
     "重连",
     "非正常停止(掉电)",
 )
+
+# 充电过程短时离线：一两分钟内重连且电量/费用连续 → 视为正常
+_BENIGN_OFFLINE_MAX_SEC = 120
+_BENIGN_OFFLINE_ENERGY_TOL_KWH = 3.0
+_BENIGN_OFFLINE_FEE_TOL_YUAN = 5.0
+
+
+def _offline_event_kind(ln: str) -> str | None:
+    """返回 down / up；非离线相关行返回 None。"""
+    if any(m in ln for m in _OFFLINE_DOWN_MARKERS):
+        return "down"
+    if any(m in ln for m in _OFFLINE_UP_MARKERS):
+        return "up"
+    return None
+
+
+def _chg_frame_ts(obj: dict[str, Any]) -> str | None:
+    for key in ("uploadTime", "endTime", "createTime"):
+        t = _parse_log_time(obj.get(key))
+        if t:
+            return t
+    return None
+
+
+def _chg_energy_fee(
+    obj: dict[str, Any],
+    *,
+    scale: int = 1000,
+) -> tuple[float | None, float | None]:
+    """chargingInfo → (电量 kWh, 电费 元)。"""
+    energy = None
+    fee = None
+    try:
+        raw_e = obj.get("totalBattery")
+        if raw_e not in (None, "", "-"):
+            energy = float(raw_e) / float(scale or 1000)
+    except (TypeError, ValueError):
+        energy = None
+    try:
+        raw_m = obj.get("chargeMoney")
+        if raw_m is None:
+            raw_m = obj.get("serverChargeMoney")
+        if raw_m not in (None, "", "-"):
+            fee = float(raw_m) / float(scale or 1000)
+    except (TypeError, ValueError):
+        fee = None
+    return energy, fee
+
+
+def _ts_in_window(ts: str | None, start: str | None, end: str | None) -> bool:
+    if not ts:
+        return False
+    key = ts[:19]
+    if start and key < start[:19]:
+        return False
+    if end and key > end[:19]:
+        return False
+    return True
+
+
+def _metrics_continuous(
+    before: tuple[float | None, float | None],
+    after: tuple[float | None, float | None],
+) -> bool:
+    """上线后相对离线前电量/费用差距不大，且无明显回退。"""
+    e0, f0 = before
+    e1, f1 = after
+    if e0 is None or e1 is None:
+        return False
+    if e1 + 0.5 < e0:
+        return False
+    if abs(e1 - e0) > _BENIGN_OFFLINE_ENERGY_TOL_KWH:
+        return False
+    if f0 is not None and f1 is not None:
+        if f1 + 1.0 < f0:
+            return False
+        if abs(f1 - f0) > _BENIGN_OFFLINE_FEE_TOL_YUAN:
+            return False
+    return True
+
+
+def _classify_mid_charge_offline(
+    *,
+    offline_events: list[tuple[str, str]],
+    chgs: list[dict[str, Any]],
+    charge_start_ts: str | None,
+    charge_end_ts: str | None,
+    scale: int = 1000,
+    max_gap_sec: int = _BENIGN_OFFLINE_MAX_SEC,
+) -> dict[str, Any]:
+    """判定充电过程中的离线重连是否属于短时正常波动。
+
+    条件：一两分钟内重新登录，且上线后电量/费用与离线前差距不大。
+    """
+    if not offline_events:
+        return {
+            "relevant": False,
+            "benign": False,
+            "gap_sec": None,
+            "message": None,
+        }
+
+    window_start = (charge_start_ts or "")[:19] or None
+    window_end = (charge_end_ts or "")[:19] or None
+    # 无充电窗时：仅有登录类事件不算过程离线
+    mid = [
+        (ts, kind)
+        for ts, kind in offline_events
+        if ts and (not window_start or _ts_in_window(ts, window_start, window_end))
+    ]
+    if not mid:
+        return {
+            "relevant": False,
+            "benign": True,
+            "gap_sec": None,
+            "message": None,
+        }
+
+    samples: list[tuple[str, float | None, float | None]] = []
+    for c in chgs:
+        if not isinstance(c, dict):
+            continue
+        ts = _chg_frame_ts(c)
+        if not ts:
+            continue
+        e, f = _chg_energy_fee(c, scale=scale)
+        samples.append((ts[:19], e, f))
+    samples.sort(key=lambda x: x[0])
+
+    def _before(ts: str) -> tuple[float | None, float | None]:
+        hit = None
+        for s_ts, e, f in samples:
+            if s_ts <= ts[:19]:
+                hit = (e, f)
+            else:
+                break
+        return hit if hit else (None, None)
+
+    def _after(ts: str) -> tuple[float | None, float | None]:
+        for s_ts, e, f in samples:
+            if s_ts >= ts[:19]:
+                return (e, f)
+        return (None, None)
+
+    downs = [(ts, kind) for ts, kind in mid if kind == "down"]
+    ups = [(ts, kind) for ts, kind in mid if kind == "up"]
+
+    # 配对：每个 down 找其后最近 up；无 down 时用相邻过程帧缺口 + up 事件
+    pairs: list[tuple[str, str, int]] = []
+    used_ups: set[int] = set()
+    for dts, _ in downs:
+        best_i = None
+        best_gap = None
+        for i, (uts, _) in enumerate(ups):
+            if i in used_ups:
+                continue
+            if uts[:19] < dts[:19]:
+                continue
+            gap = _duration_seconds(dts[:19], uts[:19])
+            if gap is None:
+                continue
+            if best_gap is None or gap < best_gap:
+                best_gap = gap
+                best_i = i
+        if best_i is not None and best_gap is not None:
+            used_ups.add(best_i)
+            pairs.append((dts, ups[best_i][0], best_gap))
+
+    if not pairs and ups:
+        # 仅有上线/重复登录：用过程帧在 up 前后的时间差近似离线时长
+        for uts, _ in ups:
+            b = _before(uts)
+            a = _after(uts)
+            # 找 up 前最后一帧与 up 后第一帧时间
+            pre_ts = None
+            for s_ts, _, _ in samples:
+                if s_ts <= uts[:19]:
+                    pre_ts = s_ts
+            post_ts = None
+            for s_ts, _, _ in samples:
+                if s_ts >= uts[:19]:
+                    post_ts = s_ts
+                    break
+            gap = _duration_seconds(pre_ts, post_ts) if pre_ts and post_ts else None
+            if gap is None:
+                gap = 0
+            pairs.append((pre_ts or uts, uts, gap))
+
+    if not pairs:
+        # 有下线无上线，无法证明短时恢复
+        return {
+            "relevant": True,
+            "benign": False,
+            "gap_sec": None,
+            "message": "充电过程中出现离线，未见短时恢复上线",
+        }
+
+    gaps_ok: list[int] = []
+    for dts, uts, gap in pairs:
+        if gap > max_gap_sec:
+            return {
+                "relevant": True,
+                "benign": False,
+                "gap_sec": gap,
+                "message": f"充电过程离线约 {gap} 秒后重连，超出短时范围",
+            }
+        before = _before(dts)
+        after = _after(uts)
+        # 若 down/up 时刻无帧，退回用 up 前后帧
+        if before[0] is None:
+            before = _before(uts)
+        if after[0] is None:
+            after = _after(uts)
+        if not _metrics_continuous(before, after):
+            return {
+                "relevant": True,
+                "benign": False,
+                "gap_sec": gap,
+                "message": "充电过程离线重连后电量/费用与离线前差异较大",
+            }
+        gaps_ok.append(gap)
+
+    gap_show = max(gaps_ok) if gaps_ok else 0
+    return {
+        "relevant": True,
+        "benign": True,
+        "gap_sec": gap_show,
+        "message": (
+            f"过程中短时离线重连（约 {gap_show} 秒），电量/费用连续，属正常"
+            if gap_show > 0
+            else "过程中短时离线重连，电量/费用连续，属正常"
+        ),
+    }
 
 
 def looks_like_order_log(text: str) -> bool:
@@ -2073,6 +2318,7 @@ def analyze_order_log(
     card_auth = False
     vin_auth = False
     offline = False
+    offline_events: list[tuple[str, str]] = []
     fault = False
     fault_notes: list[str] = []
     alarm_notes: list[str] = []
@@ -2194,9 +2440,15 @@ def analyze_order_log(
             if vm and _has_real_vin(vm.group(1)):
                 vin_auth = True
                 start_ok = True
-        if any(m in ln for m in _OFFLINE_LOG_MARKERS):
+        kind = _offline_event_kind(ln)
+        if kind or any(m in ln for m in _OFFLINE_LOG_MARKERS):
             # 离线/超时/登录为桩级事件，行内常无 serviceId，仍作为本单离线背景
             offline = True
+            ts = ts_m.group(1) if (ts_m := _TS.match(ln.strip())) else ""
+            if kind and ts:
+                offline_events.append((ts, kind))
+            elif kind and not ts:
+                offline_events.append(("", kind))
         for alarm_note in _extract_alarm_notes_from_line(ln):
             # 告警多为桩级事件（常无 serviceId），整段日志内出现即收录
             if alarm_note not in alarm_notes:
@@ -2498,10 +2750,11 @@ def analyze_order_log(
         remote_stop_msg = _extract_stop_reason_msg(remote_stop)
 
     # 掉电结束原因也视为离线场景
-    if _is_offline_finish(
+    finish_is_offline = _is_offline_finish(
         "" if finish_msg == "-" else str(finish_msg or ""),
         finish_code,
-    ):
+    )
+    if finish_is_offline:
         offline = True
 
     # 账单 startWay 并入 src 供启动方式识别
@@ -2525,6 +2778,27 @@ def analyze_order_log(
             fault_notes.append(note)
     fault = bool(fault_notes)
 
+    # 充电过程短时离线重连：一两分钟内且电量/费用连续 → 正常，不告警
+    _cdur, _cfirst, _clast = _charging_duration_from_gun_events(gun_events, gun)
+    _offline_scale = _accuracy_scale(chgs[-1] if chgs else None, 1000)
+    offline_info = _classify_mid_charge_offline(
+        offline_events=offline_events,
+        chgs=chgs,
+        charge_start_ts=_cfirst,
+        charge_end_ts=_clast or unplug_ts,
+        scale=_offline_scale,
+    )
+    offline_benign = False
+    offline_note = None
+    if offline_info.get("relevant") and offline_info.get("benign"):
+        offline_benign = True
+        offline_note = offline_info.get("message")
+    elif offline and not offline_info.get("relevant") and not finish_is_offline:
+        # 仅有会话外登录/心跳类标记，不算过程离线异常
+        offline_benign = True
+        offline = False
+    offline_alarm = bool(offline) and not offline_benign
+
     stop_info = _analyze_stop(
         has_remote_stop=has_remote_stop,
         remote_stop_msg=remote_stop_msg,
@@ -2532,7 +2806,7 @@ def analyze_order_log(
         finish_code=finish_code,
         gun_events=gun_events,
         gun=gun,
-        offline_reconnect=offline,
+        offline_reconnect=finish_is_offline or offline_alarm,
         alarm_notes=alarm_notes,
         platform_guard_msg=platform_guard_msg,
     )
@@ -2982,13 +3256,19 @@ def analyze_order_log(
         else:
             steps.append(f"{n}. {_cn_datetime(end_time)}　充电结束并上报账单。")
         n += 1
-    if offline:
+    if offline_alarm:
         steps.append(f"{n}. 过程中曾出现离线/超时记录，需到设备上核实充电数据，请设备方协助排查。")
+        n += 1
+    elif offline_benign and offline_note:
+        steps.append(f"{n}. {offline_note}。")
         n += 1
     if stop_info.get("tip"):
         steps.append(f"{n}. {stop_info['tip']}")
         n += 1
-    steps.append(f"{n}. 结束后枪口恢复空闲/待充" + ("，无离线、无故障告警记录。" if not offline and not fault else "。"))
+    steps.append(
+        f"{n}. 结束后枪口恢复空闲/待充"
+        + ("，无离线、无故障告警记录。" if not offline_alarm and not fault else "。")
+    )
     out.extend(steps or ["1. 已提取订单关键充电数据。"])
 
     out += _section("八、结论")
@@ -3058,8 +3338,10 @@ def analyze_order_log(
             msg = f"2. 平台停止：{stop_info['reason']}。"
         else:
             msg = f"2. 平台下发远程停止，停止原因：{stop_info['reason']}。"
-        if offline:
+        if offline_alarm:
             msg += "过程中曾出现离线，需到设备上核实充电数据，请设备方协助排查。"
+        elif offline_benign and offline_note:
+            msg += offline_note + "。"
         bullets.append(msg)
     elif stop_info["category"] == "estop_suspect":
         bullets.append("2. 枪口曾短暂 TROUBLE 后恢复，且无告警信息，疑似用户按下急停，请向现场确认。")
@@ -3086,11 +3368,15 @@ def analyze_order_log(
         msg = (
             f"2. 无平台远程停止；{stop_info['stop_type']}，设备原因：{stop_info['device_finish_reason']}。"
         )
-        if offline:
+        if offline_alarm:
             msg += "过程中曾出现离线，需到设备上核实充电数据，请设备方协助排查。"
+        elif offline_benign and offline_note:
+            msg += offline_note + "。"
         bullets.append(msg)
-    elif offline:
+    elif offline_alarm:
         bullets.append("2. 充电过程中出现离线/超时，需到设备上核实充电数据，请设备方协助排查。")
+    elif offline_benign and offline_note:
+        bullets.append(f"2. {offline_note}。")
     elif not fault and not alarm_notes:
         bullets.append("2. 充电期间无离线、无故障、无告警，也无平台远程停止指令。")
     else:
@@ -3132,7 +3418,7 @@ def analyze_order_log(
             bullets.append(f"{len(bullets) + 1}. 启动校验未通过，详见启动校验说明。")
     if need_user_confirm and stop_info.get("tip"):
         bullets.append(f"{len(bullets) + 1}. {stop_info['tip']}")
-    if offline and not any("需到设备上核实充电数据" in b for b in bullets):
+    if offline_alarm and not any("需到设备上核实充电数据" in b for b in bullets):
         bullets.append(
             f"{len(bullets) + 1}. 过程中曾出现离线，需到设备上核实充电数据，请设备方协助排查。"
         )
@@ -3175,7 +3461,7 @@ def analyze_order_log(
             f"综合判断：{stop_info['stop_type']}，{stop_info.get('tip') or '请现场确认后再定性。'}\n"
             "需到设备上核实相关数据，请设备方协助排查。"
         )
-    elif offline:
+    elif offline_alarm:
         if stop_info["category"] == "offline_gun_fault":
             out.append(
                 "综合判断：离线上报枪口故障（先离线、重连后报 TROUBLE），非人工急停；"
@@ -3203,10 +3489,13 @@ def analyze_order_log(
             out.append("综合判断：平台远程停止流程完整，结算数据可核对。")
             valid = True
             verdict = "综合判断：平台远程停止流程完整，结算数据可核对。"
-    elif normal and not offline and stop_info["category"] != "unknown":
-        out.append(f"综合判断：{stop_info['stop_type']}，结算与结束原因可核对。")
+    elif normal and not offline_alarm and stop_info["category"] != "unknown":
+        base = f"综合判断：{stop_info['stop_type']}，结算与结束原因可核对。"
+        if offline_benign and offline_note:
+            base = f"综合判断：{stop_info['stop_type']}，{offline_note}；结算与结束原因可核对。"
+        out.append(base)
         valid = True
-        verdict = f"综合判断：{stop_info['stop_type']}，结算与结束原因可核对。"
+        verdict = base
     else:
         out.append("综合判断：请结合日志与现场情况复核。")
         out.append("需到设备上核实相关数据，请设备方协助排查。")
@@ -3344,6 +3633,18 @@ def analyze_order_log(
             "value": "；".join(alarm_notes[:8]) if alarm_notes else "无",
         },
         {
+            "name": "过程离线",
+            "value": (
+                offline_note
+                if offline_benign and offline_note
+                else (
+                    "有（需复核）"
+                    if offline_alarm
+                    else ("有（会话外标记，不影响过程）" if offline_benign else "无")
+                )
+            ),
+        },
+        {
             "name": "同桩其他枪口提示",
             "value": "；".join(other_gun_notes[:3]) if other_gun_notes else "无",
         },
@@ -3467,5 +3768,10 @@ def analyze_order_log(
             "fault_notes": fault_notes,
             "alarm_notes": alarm_notes,
             "other_gun_notes": other_gun_notes,
+            "offline": offline,
+            "offline_alarm": offline_alarm,
+            "offline_benign": offline_benign,
+            "offline_note": offline_note,
+            "offline_info": offline_info,
         },
     }

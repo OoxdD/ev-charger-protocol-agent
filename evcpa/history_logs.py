@@ -42,6 +42,7 @@ def fetch_device_history_logs(
     body: dict[str, Any] = {
         "deviceNo": device_no,
         "startTime": int(start_time),
+        "isHexLog": 0,
     }
     if cmd not in (None, ""):
         body["cmd"] = str(cmd).strip()

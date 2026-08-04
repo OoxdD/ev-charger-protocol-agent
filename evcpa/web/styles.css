@@ -69,6 +69,197 @@ html, body {
   color: #e8f5f0;
 }
 
+.top-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.user-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.user-name {
+  font-size: 0.9rem;
+  color: #b7d4c8;
+}
+
+.login-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px 20px;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse 90% 70% at 50% -10%, rgba(52, 211, 153, 0.28), transparent 55%),
+    radial-gradient(ellipse 50% 45% at 12% 78%, rgba(15, 143, 108, 0.35), transparent 60%),
+    radial-gradient(ellipse 45% 40% at 88% 72%, rgba(45, 180, 160, 0.18), transparent 58%),
+    linear-gradient(165deg, #071410 0%, #0f241c 38%, #0a1814 72%, #060e0c 100%);
+}
+
+/* display:flex 会盖掉 UA 的 [hidden]，必须显式隐藏 */
+.login-gate[hidden] {
+  display: none !important;
+}
+
+.login-gate::before {
+  content: "";
+  position: absolute;
+  inset: -20%;
+  z-index: 0;
+  background:
+    radial-gradient(circle at 30% 40%, rgba(52, 211, 153, 0.14), transparent 28%),
+    radial-gradient(circle at 70% 55%, rgba(20, 160, 130, 0.12), transparent 32%);
+  animation: login-glow 12s ease-in-out infinite alternate;
+  pointer-events: none;
+}
+
+.login-gate::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  opacity: 0.4;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+  background-size: 56px 56px;
+  background-position: center;
+  mask-image: radial-gradient(ellipse 70% 60% at 50% 45%, #000 20%, transparent 75%);
+  pointer-events: none;
+}
+
+@keyframes login-glow {
+  from { transform: translate(-2%, -1%) scale(1); opacity: 0.85; }
+  to { transform: translate(2%, 2%) scale(1.06); opacity: 1; }
+}
+
+.login-card {
+  position: relative;
+  z-index: 1;
+  width: min(520px, 100%);
+  padding: 42px 40px 36px;
+  background: linear-gradient(180deg, rgba(250, 253, 251, 0.98) 0%, rgba(241, 248, 245, 0.96) 100%);
+  border: 1px solid rgba(16, 42, 36, 0.12);
+  border-radius: 22px;
+  box-shadow:
+    0 28px 64px rgba(2, 12, 10, 0.55),
+    0 0 0 1px rgba(255, 255, 255, 0.4) inset,
+    0 0 80px rgba(34, 197, 140, 0.12);
+  animation: login-in 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes login-in {
+  from { opacity: 0; transform: translateY(14px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 28px;
+}
+
+.login-mark {
+  width: 60px;
+  height: 60px;
+  border-radius: 16px;
+}
+
+.login-kicker {
+  margin: 0 0 4px;
+  font-family: "DM Sans", var(--font);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.login-product {
+  margin: 0;
+  font-size: 1.55rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+  line-height: 1.25;
+}
+
+.login-card .field {
+  margin-bottom: 18px;
+}
+
+.login-card .field span {
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.login-card input[type="text"],
+.login-card input[type="password"] {
+  width: 100%;
+  padding: 14px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+  font-size: 1.02rem;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.login-card input[type="text"]:focus,
+.login-card input[type="password"]:focus {
+  border-color: rgba(14, 138, 105, 0.55);
+  box-shadow: 0 0 0 3px rgba(14, 138, 105, 0.14);
+}
+
+.login-card input::placeholder {
+  color: #9aada4;
+}
+
+.login-remember {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -4px 0 16px;
+  cursor: pointer;
+  user-select: none;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.login-remember input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.login-error {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--error-bg);
+  color: var(--error);
+  font-size: 0.92rem;
+}
+
+.login-submit {
+  width: 100%;
+  margin-top: 8px;
+  min-height: 50px;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
 .brand {
   display: flex;
   gap: 14px;

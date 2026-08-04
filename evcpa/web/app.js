@@ -34,9 +34,188 @@
   const candBlock = $("candBlock");
   const candList = $("candList");
   const candTitle = $("candTitle");
+  const loginGate = $("loginGate");
+  const mainApp = $("mainApp");
+  const loginForm = $("loginForm");
+  const loginUser = $("loginUser");
+  const loginPass = $("loginPass");
+  const loginError = $("loginError");
+  const loginBtn = $("loginBtn");
+  const loginRemember = $("loginRemember");
+  const userBar = $("userBar");
+  const userName = $("userName");
+  const logoutBtn = $("logoutBtn");
+
+  const REMEMBER_USER_KEY = "evcpa_remember_user";
+  const REMEMBER_FLAG_KEY = "evcpa_remember_flag";
 
   let inputMode = "auto";
   let lastResult = null;
+  let authEnabled = false;
+  let currentUser = null;
+
+  function loadRememberedUser() {
+    try {
+      const flag = localStorage.getItem(REMEMBER_FLAG_KEY) === "1";
+      const saved = localStorage.getItem(REMEMBER_USER_KEY) || "";
+      if (loginRemember) loginRemember.checked = flag;
+      if (loginUser && flag && saved) loginUser.value = saved;
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  function saveRememberedUser(username) {
+    try {
+      if (loginRemember && loginRemember.checked && username) {
+        localStorage.setItem(REMEMBER_FLAG_KEY, "1");
+        localStorage.setItem(REMEMBER_USER_KEY, username);
+      } else {
+        localStorage.removeItem(REMEMBER_FLAG_KEY);
+        localStorage.removeItem(REMEMBER_USER_KEY);
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  async function apiFetch(url, options = {}) {
+    const opts = { ...options, credentials: "same-origin" };
+    const res = await fetch(url, opts);
+    if (res.status === 401 && authEnabled) {
+      showLogin("会话已过期，请重新登录");
+      throw new Error("未登录或会话已过期");
+    }
+    return res;
+  }
+
+  function showLogin(msg) {
+    if (mainApp) {
+      mainApp.hidden = true;
+      mainApp.setAttribute("aria-hidden", "true");
+    }
+    if (loginGate) {
+      loginGate.hidden = false;
+      loginGate.removeAttribute("aria-hidden");
+      loginGate.style.display = "";
+    }
+    if (loginError) {
+      if (msg) {
+        loginError.hidden = false;
+        loginError.textContent = msg;
+      } else {
+        loginError.hidden = true;
+        loginError.textContent = "";
+      }
+    }
+    if (loginPass) loginPass.value = "";
+    loadRememberedUser();
+    setTimeout(() => {
+      if (loginUser && loginUser.value) {
+        if (loginPass) loginPass.focus();
+      } else if (loginUser) {
+        loginUser.focus();
+      }
+    }, 0);
+  }
+
+  function showApp(username) {
+    if (loginGate) {
+      loginGate.hidden = true;
+      loginGate.setAttribute("aria-hidden", "true");
+      loginGate.style.display = "none";
+    }
+    if (mainApp) {
+      mainApp.hidden = false;
+      mainApp.removeAttribute("aria-hidden");
+    }
+    currentUser = username || null;
+    if (userBar && userName) {
+      if (authEnabled && username) {
+        userBar.hidden = false;
+        userName.textContent = username;
+      } else {
+        userBar.hidden = true;
+        userName.textContent = "";
+      }
+    }
+  }
+
+  async function checkAuth() {
+    const res = await fetch("/api/me", { credentials: "same-origin" });
+    if (!res.ok) throw new Error("无法检查登录状态");
+    const data = await res.json();
+    authEnabled = !!data.auth_enabled;
+    if (!authEnabled) {
+      showApp(null);
+      return true;
+    }
+    if (data.authenticated && data.username) {
+      showApp(data.username);
+      return true;
+    }
+    showLogin();
+    return false;
+  }
+
+  async function doLogin(e) {
+    if (e) e.preventDefault();
+    const username = (loginUser && loginUser.value || "").trim();
+    const password = (loginPass && loginPass.value) || "";
+    if (!username || !password) {
+      showLogin("请输入用户名和密码");
+      return;
+    }
+    if (loginBtn) {
+      loginBtn.disabled = true;
+      loginBtn.textContent = "登录中…";
+    }
+    try {
+      const res = await fetch("/api/login", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = typeof data.detail === "string" ? data.detail : "用户名或密码错误";
+        showLogin(detail);
+        return;
+      }
+      saveRememberedUser(username);
+      authEnabled = data.auth_enabled !== false;
+      showApp(data.username || username);
+      await bootApp();
+    } catch (err) {
+      showLogin(err.message || String(err));
+    } finally {
+      if (loginBtn) {
+        loginBtn.disabled = false;
+        loginBtn.textContent = "登录";
+      }
+    }
+  }
+
+  async function doLogout() {
+    try {
+      await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
+    } catch (_) {
+      /* ignore */
+    }
+    currentUser = null;
+    showLogin();
+  }
+
+  async function bootApp() {
+    setDefaultFetchTime();
+    try {
+      await loadProtocols();
+    } catch (err) {
+      protocolCount.textContent = "协议列表加载失败";
+      showError(err.message || String(err));
+    }
+  }
 
   const DEVICE_FOLLOWUP = "需到设备上核实相关数据，请设备方协助排查。";
 
@@ -166,10 +345,11 @@
   }
 
   async function loadProtocols() {
-    const res = await fetch("/protocols");
+    const res = await apiFetch("/protocols");
     if (!res.ok) throw new Error("无法加载协议列表");
     const list = await res.json();
     protocolCount.textContent = `已支持 ${list.length} 种协议`;
+    protocolSel.querySelectorAll("option:not([value=''])").forEach((o) => o.remove());
     for (const p of list) {
       const opt = document.createElement("option");
       opt.value = p.id;
@@ -465,7 +645,7 @@
     analyzeBtn.textContent = "分析中…";
     try {
       const body = buildBody();
-      const res = await fetch("/analyze", {
+      const res = await apiFetch("/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -558,7 +738,7 @@
     fetchBtn.textContent = "拉取中…";
     if (fetchHint) fetchHint.textContent = "正在从设备侧拉取历史报文…";
     try {
-      const res = await fetch("/history-logs", {
+      const res = await apiFetch("/history-logs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -846,10 +1026,14 @@
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") analyze();
   });
 
-  setDefaultFetchTime();
+  if (loginForm) loginForm.addEventListener("submit", doLogin);
+  if (logoutBtn) logoutBtn.addEventListener("click", doLogout);
 
-  loadProtocols().catch((err) => {
-    protocolCount.textContent = "协议列表加载失败";
-    showError(err.message || String(err));
-  });
+  checkAuth()
+    .then((ok) => {
+      if (ok) return bootApp();
+    })
+    .catch((err) => {
+      showLogin(err.message || String(err));
+    });
 })();
