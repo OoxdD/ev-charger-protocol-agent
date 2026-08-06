@@ -59,15 +59,6 @@ class PutianParser(JsonHeuristicParser):
     STATUS_VENDOR = "putian"
 
 
-class KehuaParser(JsonHeuristicParser):
-    protocol_id = ProtocolId.KEHUA
-    protocol_name = "科华"
-    KEYS = {"kehua", "KH", "moduleId", "dcVoltage", "dcCurrent", "moduleStatus", "pduId"}
-    KEYWORDS = ("kehua", "科华", "kehuadata")
-    STATUS_VENDOR = "kehua"
-    BINARY_MAGIC = b"\xA5\x5A"
-
-
 class KstarParser(JsonHeuristicParser):
     protocol_id = ProtocolId.KSTAR
     protocol_name = "科士达"

@@ -7,6 +7,7 @@ from evcpa.protocols.csg import CsgParser
 from evcpa.protocols.huawei import HuaweiParser
 from evcpa.protocols.iec104 import Iec104Parser
 from evcpa.protocols.infypower import InfypowerParser
+from evcpa.protocols.kehua import KehuaParser
 from evcpa.protocols.ocpp import OcppParser
 from evcpa.protocols.shenghong import ShenghongParser
 from evcpa.protocols.vendors_extra import (
@@ -16,7 +17,6 @@ from evcpa.protocols.vendors_extra import (
     DakuyunParser,
     EverchargeParser,
     KamaisiParser,
-    KehuaParser,
     KstarParser,
     LvtongParser,
     NariParser,
@@ -43,6 +43,7 @@ def all_parsers() -> list[ProtocolParser]:
         WanmaParser(),
         Ascii68Parser(),
         ShenghongParser(),
+        KehuaParser(),
         CsgParser(),
         OcppParser(),
         Iec104Parser(),
@@ -56,7 +57,6 @@ def all_parsers() -> list[ProtocolParser]:
         XiaojuParser(),
         AonengParser(),
         PutianParser(),
-        KehuaParser(),
         KstarParser(),
         AbbParser(),
         EverchargeParser(),
@@ -79,6 +79,7 @@ __all__ = [
     "YkcParser",
     "XingxingParser",
     "ShenghongParser",
+    "KehuaParser",
     "HuaweiParser",
     "InfypowerParser",
     "OcppParser",

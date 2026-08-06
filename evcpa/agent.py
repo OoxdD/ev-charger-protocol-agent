@@ -48,6 +48,8 @@ def _protocol_hint_from_bytes(data: bytes, cmd_hint: str | None = None) -> str |
         return "wanma"
     if len(data) >= 2 and data[0] == 0xAA and data[1] == 0xF5:
         return "shenghong"
+    if len(data) >= 2 and data[:2] == b"KH":
+        return "kehua"
     cmd = (cmd_hint or "").upper().lstrip("0X")
     # 万马命令字多为 4 位（如 2002）；云快充多为 2 位
     if len(cmd) == 4 and cmd not in {"0000"}:

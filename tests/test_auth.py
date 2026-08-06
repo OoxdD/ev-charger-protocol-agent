@@ -68,6 +68,10 @@ def test_protected_requires_login(client, auth_env):
         json={"device_no": "1", "start_time": 1, "end_time": 2},
     ).status_code == 401
     assert client.post(
+        "/service-logs",
+        json={"service": "S1"},
+    ).status_code == 401
+    assert client.post(
         "/card-auth-query",
         json={"text": "卡未注册，卡号: 00000000DDE4BF6B"},
     ).status_code == 401

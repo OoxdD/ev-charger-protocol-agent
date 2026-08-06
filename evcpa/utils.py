@@ -13,6 +13,7 @@ _LOG_CMD_BRACKET = re.compile(
     re.IGNORECASE,
 )
 _FRAME_STARTS = (
+    "4B48",      # 科华 KH
     "9955BBAA",  # 万马 LE
     "AABB5599",  # 万马 BE
     "AAF5",      # 盛弘

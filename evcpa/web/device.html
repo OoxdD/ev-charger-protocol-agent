@@ -3,13 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>订单查询 · 充电桩报文分析</title>
+  <title>设备报文 · 充电桩报文分析</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/styles.css?v=20260806-order" />
 </head>
-<body class="page-order">
+<body class="page-device">
   <div class="bg" aria-hidden="true"></div>
 
   <div id="loginGate" class="login-gate" hidden>
@@ -46,7 +46,7 @@
           <div class="brand-text">
             <p class="brand-kicker">EV Protocol Agent</p>
             <h1>充电桩报文分析</h1>
-            <p class="tagline">按订单号拉取报文 · 识别协议 · 输出可转发的研判结论</p>
+            <p class="tagline">按设备编号与时间拉取日志 · 识别协议 · 输出可转发的研判结论</p>
           </div>
         </div>
         <div class="top-aside">
@@ -58,8 +58,8 @@
         </div>
       </div>
       <nav class="page-nav" aria-label="页面切换">
-        <a class="page-nav-link active" href="/" aria-current="page">订单查询</a>
-        <a class="page-nav-link" href="/device">设备报文</a>
+        <a class="page-nav-link" href="/">订单查询</a>
+        <a class="page-nav-link active" href="/device" aria-current="page">设备报文</a>
         <a class="page-nav-link" href="/cards">卡号查询</a>
       </nav>
     </header>
@@ -81,17 +81,47 @@
         <details class="fetch-box" open>
           <summary>
             <span class="step-badge">1</span>
-            <span>按订单拉取报文</span>
+            <span>从设备拉取报文</span>
           </summary>
-          <div class="fetch-grid fetch-grid-service">
+          <div class="fetch-grid">
             <label class="field">
-              <span>订单号 / serviceId *</span>
-              <input type="text" id="fetchService" placeholder="例如 S2608050899023698405" autocomplete="off" />
+              <span>设备编号 deviceNo *</span>
+              <input type="text" id="fetchDeviceNo" placeholder="例如 88668820241220125801" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>开始日期 *</span>
+              <input type="date" id="fetchStartDate" />
+            </label>
+            <label class="field">
+              <span>开始时刻 *</span>
+              <div class="time-row">
+                <select id="fetchStartHour" aria-label="开始小时"></select>
+                <span class="time-sep">时</span>
+                <select id="fetchStartMinute" aria-label="开始分钟"></select>
+                <span class="time-sep">分</span>
+              </div>
+            </label>
+            <label class="field">
+              <span>结束日期 *</span>
+              <input type="date" id="fetchEndDate" />
+            </label>
+            <label class="field">
+              <span>结束时刻 *</span>
+              <div class="time-row">
+                <select id="fetchEndHour" aria-label="结束小时"></select>
+                <span class="time-sep">时</span>
+                <select id="fetchEndMinute" aria-label="结束分钟"></select>
+                <span class="time-sep">分</span>
+              </div>
+            </label>
+            <label class="field">
+              <span>最大条数</span>
+              <input type="number" id="fetchLimit" min="1" max="15000" value="1000" />
             </label>
           </div>
           <div class="actions fetch-actions">
             <button type="button" class="btn accent" id="fetchBtn">拉取报文</button>
-            <p class="hint inline" id="fetchHint">输入订单号后拉取，确认内容后再分析。</p>
+            <p class="hint inline" id="fetchHint">拉取后先展示在下方，确认后再分析。</p>
             <button type="button" class="btn ghost fetch-download" id="downloadPayloadBtn">下载报文</button>
           </div>
         </details>
@@ -116,7 +146,7 @@
 
         <label class="field grow">
           <span>报文内容</span>
-          <textarea id="payload" spellcheck="false" placeholder="粘贴平台订单日志，或使用上方按订单号拉取&#10;&#10;支持 socInfo / chargingInfo / recordInfo 等业务日志，以及十六进制 / JSON 协议帧"></textarea>
+          <textarea id="payload" spellcheck="false" placeholder="粘贴平台订单日志，或使用上方拉取设备历史报文&#10;&#10;支持 socInfo / chargingInfo / recordInfo 等业务日志，以及十六进制 / JSON 协议帧"></textarea>
         </label>
 
         <div class="actions sticky-actions">
@@ -146,7 +176,7 @@
           <div class="empty-illus" aria-hidden="true"></div>
           <p class="empty-title">等待分析</p>
           <ol class="empty-steps">
-            <li>填写订单号 / serviceId，拉取报文</li>
+            <li>填写设备编号与起止时间，拉取报文</li>
             <li>核对左侧报文内容（可再筛服务ID）</li>
             <li>点击「开始分析」查看结论</li>
           </ol>
@@ -191,6 +221,6 @@
       <span>本地分析服务 · 数据不上传第三方</span>
     </footer>
   </div>
-  <script src="/static/app.js?v=20260806-svcid"></script>
+  <script src="/static/app.js?v=20260806-limit"></script>
 </body>
 </html>

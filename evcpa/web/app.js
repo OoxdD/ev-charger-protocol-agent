@@ -15,12 +15,14 @@
   const fetchBtn = $("fetchBtn");
   const fetchHint = $("fetchHint");
   const fetchDeviceNo = $("fetchDeviceNo");
+  const fetchService = $("fetchService");
   const fetchStartDate = $("fetchStartDate");
   const fetchStartHour = $("fetchStartHour");
   const fetchStartMinute = $("fetchStartMinute");
   const fetchEndDate = $("fetchEndDate");
   const fetchEndHour = $("fetchEndHour");
   const fetchEndMinute = $("fetchEndMinute");
+  const fetchLimit = $("fetchLimit");
   const fetchCmd = $("fetchCmd");
   const fetchDirection = $("fetchDirection");
   const emptyState = $("emptyState");
@@ -750,10 +752,12 @@
     }
     const cmd = (fetchCmd && fetchCmd.value || "").trim();
     const dirRaw = fetchDirection && fetchDirection.value;
+    const limit = Number((fetchLimit && fetchLimit.value) || 1000);
     const body = {
       device_no: deviceNo,
       start_time: startMs,
       end_time: endMs,
+      limit_count: Math.min(15000, Math.max(1, limit || 1000)),
     };
     if (cmd) body.cmd = cmd;
     if (dirRaw !== "" && dirRaw != null) body.is_send_log = Number(dirRaw);
@@ -792,6 +796,59 @@
     }
   }
 
+  async function fetchServiceLogs() {
+    if (!fetchBtn) return;
+    const service = (fetchService && fetchService.value || "").trim();
+    if (!service) {
+      if (fetchHint) fetchHint.textContent = "请填写订单号 / serviceId。";
+      return;
+    }
+
+    fetchBtn.disabled = true;
+    fetchBtn.textContent = "拉取中…";
+    if (fetchHint) fetchHint.textContent = "正在按订单拉取报文…";
+    try {
+      const res = await apiFetch("/service-logs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ service }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data.detail != null ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)) : "拉取失败";
+        throw new Error(detail);
+      }
+      const text = data.text || "";
+      payload.value = text;
+      const sid = data.service_id || data.serviceId || null;
+      if (sid && orderFilterInput) {
+        orderFilterInput.value = String(sid);
+      }
+      document.querySelector('.tab[data-mode="auto"]').click();
+      const count = data.count != null ? data.count : 0;
+      const msg = data.msg ? `（${data.msg}）` : "";
+      if (fetchHint) {
+        fetchHint.textContent = count
+          ? `已拉取 ${count} 条报文${msg}，已填入下方文本框。确认后点击「开始分析」。`
+          : `未查到报文${msg}。请核对订单号后重试。`;
+      }
+      if (fileHint) fileHint.textContent = count ? `来源：订单报文（${service}，${count} 条）` : "";
+      showEmpty();
+    } catch (err) {
+      if (fetchHint) fetchHint.textContent = err.message || String(err);
+    } finally {
+      fetchBtn.disabled = false;
+      fetchBtn.textContent = "拉取报文";
+    }
+  }
+
+  function onFetchClick() {
+    if (fetchService) {
+      return fetchServiceLogs();
+    }
+    return fetchHistoryLogs();
+  }
+
   document.querySelectorAll(".tab").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
@@ -818,13 +875,26 @@
   clearBtn.addEventListener("click", () => {
     payload.value = "";
     if (orderFilterInput) orderFilterInput.value = "";
+    if (fetchService) fetchService.value = "";
     fileInput.value = "";
     fileHint.textContent = "";
-    if (fetchHint) fetchHint.textContent = "拉取后先展示在下方，确认后再分析。";
+    if (fetchHint) {
+      fetchHint.textContent = fetchService
+        ? "输入订单号后拉取，确认内容后再分析。"
+        : "拉取后先展示在下方，确认后再分析。";
+    }
     showEmpty();
   });
 
-  if (fetchBtn) fetchBtn.addEventListener("click", fetchHistoryLogs);
+  if (fetchBtn) fetchBtn.addEventListener("click", onFetchClick);
+  if (fetchService) {
+    fetchService.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        fetchServiceLogs();
+      }
+    });
+  }
 
   function stampName(prefix, ext) {
     const d = new Date();

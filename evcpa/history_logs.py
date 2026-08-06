@@ -31,12 +31,13 @@ def fetch_device_history_logs(
     cmd: str | None = None,
     is_send_log: int | None = None,
     sort_type: int | None = 1,
+    limit_count: int | None = 1000,
     timeout_sec: float = 30.0,
 ) -> dict[str, Any]:
     """调用外部接口拉取设备历史报文。
 
     startTime / endTime 使用毫秒级时间戳（如 1785296760000）。
-    实际上游传参：startTime 往前 1 分钟，endTime 往后 3 分钟；不传 limitCount。
+    实际上游传参：startTime 往前 1 分钟，endTime 往后 3 分钟。
     """
     device_no = (device_no or "").strip()
     if not device_no:
@@ -63,6 +64,8 @@ def fetch_device_history_logs(
         body["isSendLog"] = int(is_send_log)
     if sort_type is not None:
         body["sortType"] = int(sort_type)
+    if limit_count is not None:
+        body["limitCount"] = int(limit_count)
 
     base_url, skey = history_logs_config()
     sep = "&" if "?" in base_url else "?"

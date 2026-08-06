@@ -728,6 +728,14 @@ h1 {
   grid-column: 1 / -1;
 }
 
+.fetch-grid-service {
+  grid-template-columns: 1fr;
+}
+
+.fetch-grid-service > .field:first-child {
+  grid-column: auto;
+}
+
 .time-row {
   display: flex;
   align-items: center;

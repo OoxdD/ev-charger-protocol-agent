@@ -1,4 +1,4 @@
-"""多帧粘包拆分：云快充 / 蔚景 / 万马 / 盛弘 / 南网。"""
+"""多帧粘包拆分：云快充 / 蔚景 / 万马 / 盛弘 / 南网 / 科华。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from evcpa.utils import crc16_modbus, crc16_xmodem, crc32_iso_hdlc, crc32_mpeg2,
 class FrameSlice:
     offset: int
     data: bytes
-    protocol_hint: str | None = None  # ykc | weijing | wanma | shenghong | csg
+    protocol_hint: str | None = None  # ykc | weijing | wanma | shenghong | csg | kehua
 
 
 def _ykc_len_at(raw: bytes, i: int) -> int | None:
@@ -155,6 +155,30 @@ def _score_csg(frame: bytes) -> float:
     return 0.55
 
 
+def _kehua_len_at(raw: bytes, i: int) -> int | None:
+    if i + 37 > len(raw) or raw[i : i + 2] != b"KH":
+        return None
+    total = read_u16_be(raw, i + 2)
+    if total < 37 or total > 0x2000 or i + total > len(raw):
+        return None
+    if raw[i + total - 1] != 0x68:
+        return None
+    return total
+
+
+def _kehua_crc_ok(frame: bytes) -> bool:
+    if len(frame) < 37:
+        return False
+    recv = read_u16_be(frame, len(frame) - 3)
+    return crc16_modbus(frame[:-3]) == recv
+
+
+def _score_kehua(frame: bytes) -> float:
+    if not _kehua_len_at(frame, 0):
+        return 0.0
+    return 0.95 if _kehua_crc_ok(frame) else 0.55
+
+
 def classify_frame(frame: bytes) -> str | None:
     scores = {
         "ykc": _score_ykc(frame),
@@ -162,6 +186,7 @@ def classify_frame(frame: bytes) -> str | None:
         "wanma": _score_wanma(frame),
         "shenghong": _score_shenghong(frame),
         "csg": _score_csg(frame),
+        "kehua": _score_kehua(frame),
     }
     best = max(scores, key=scores.get)
     if scores[best] <= 0:
@@ -177,6 +202,13 @@ def split_frames(raw: bytes) -> list[FrameSlice]:
     i = 0
     n = len(raw)
     while i < n:
+        if i + 2 <= n and raw[i : i + 2] == b"KH":
+            L = _kehua_len_at(raw, i)
+            if L:
+                out.append(FrameSlice(offset=i, data=raw[i : i + L], protocol_hint="kehua"))
+                i += L
+                continue
+
         if i + 4 <= n and raw[i : i + 4] in (
             bytes.fromhex("AABB5599"),
             bytes.fromhex("9955BBAA"),

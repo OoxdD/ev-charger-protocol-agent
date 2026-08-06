@@ -3316,7 +3316,7 @@ def analyze_order_log(
         )
         + f"，{_fmt_tou_brief(_tou_map(bill_src), bill_scale)}。"
         if bill_src
-        else "账单电量快照：无结算/账单数据。"
+        else "账单电量快照：无结算/账单数据（日志中无 --recordInfo 或「上报账单」；若订单未结束属正常）。"
     )
     for i, ck in enumerate(energy_checks, 1):
         mark = "通过" if ck.get("ok") else "异常"
@@ -3619,15 +3619,29 @@ def analyze_order_log(
                 )
         else:
             bullets.append("3. 已输出费用与停止相关字段。")
-        bullets.append(f"4. {'未产生占桩计费，占桩费用为 0 元。' if not has_occupy else '存在占桩计费，详见费用明细。'}")
+        if not bill_src and proc_frame:
+            bullets.append(
+                f"{len(bullets) + 1}. 日志未包含结算账单（recordInfo/上报账单），"
+                "费用与电量取自过程 chargingInfo 末帧；若订单仍在充电或拉取时间窗未覆盖结算，属正常。"
+            )
+        bullets.append(
+            f"{len(bullets) + 1}. "
+            f"{'未产生占桩计费，占桩费用为 0 元。' if not has_occupy else '存在占桩计费，详见费用明细。'}"
+        )
         if total_kwh is not None:
             only_ping = (jian in (0, None)) and (feng in (0, None)) and (gu in (0, None)) and bool(ping)
             if only_ping:
-                bullets.append(f"5. 分时电量均归集在平段；实际充电量以表计 {total_kwh:.3f} kwh 为准。")
+                bullets.append(
+                    f"{len(bullets) + 1}. 分时电量均归集在平段；实际充电量以表计 {total_kwh:.3f} kwh 为准。"
+                )
             else:
-                bullets.append(f"5. 分时电量以结算字段为准；实际充电量以表计 {total_kwh:.3f} kwh 为准。")
+                bullets.append(
+                    f"{len(bullets) + 1}. 分时电量以结算字段为准；实际充电量以表计 {total_kwh:.3f} kwh 为准。"
+                )
         if energy_mismatch:
-            bullets.append("6. 过程电量/账单校验：发现不一致，详见“四、过程与账单校验”。")
+            bullets.append(
+                f"{len(bullets) + 1}. 过程电量/账单校验：发现不一致，详见“四、过程与账单校验”。"
+            )
         if start_mismatch:
             bullets.append(f"{len(bullets) + 1}. 启动校验未通过，详见启动校验说明。")
     if need_user_confirm and stop_info.get("tip"):
@@ -3772,11 +3786,19 @@ def analyze_order_log(
         },
         {
             "name": "账单分时",
-            "value": _fmt_tou_brief(_tou_map(bill_src), bill_scale) if bill_src else "-",
+            "value": (
+                _fmt_tou_brief(_tou_map(bill_src), bill_scale)
+                if bill_src
+                else "无（日志无 recordInfo/结算账单）"
+            ),
         },
         {
             "name": "账单总电量",
-            "value": _fmt_kwh((bill_src or {}).get("totalBattery"), bill_scale) if bill_src else "-",
+            "value": (
+                _fmt_kwh((bill_src or {}).get("totalBattery"), bill_scale)
+                if bill_src
+                else "无（日志无 recordInfo/结算账单）"
+            ),
         },
         {
             "name": "过程与账单校验",

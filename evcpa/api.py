@@ -20,6 +20,7 @@ from evcpa.auth import (
 from evcpa.card_query import extract_card_auth_events, summarize_card_auth
 from evcpa.history_logs import fetch_device_history_logs, logs_to_text
 from evcpa.order_report import analyze_order_log, looks_like_order_log
+from evcpa.service_logs import fetch_service_logs
 
 agent = ProtocolAgent()
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -52,6 +53,7 @@ class HistoryLogsRequest(BaseModel):
     cmd: Optional[str] = Field(None, description="报文命令，可选")
     is_send_log: Optional[int] = Field(None, description="1=只查下行，0=上行，不传=全部")
     sort_type: Optional[int] = Field(1, description="排序，默认1正序，<0倒序")
+    limit_count: Optional[int] = Field(1000, description="最大条数，默认1000，最大15000")
 
 
 class LoginRequest(BaseModel):
@@ -66,13 +68,28 @@ class CardAuthQueryRequest(BaseModel):
     cmd: Optional[str] = Field(None, description="报文命令，可选")
     is_send_log: Optional[int] = Field(None, description="1=只查下行，0=上行，不传=全部")
     sort_type: Optional[int] = Field(1, description="排序，默认1正序")
+    limit_count: Optional[int] = Field(1000, description="最大条数，默认1000，最大15000")
     text: Optional[str] = Field(None, description="直接粘贴的平台日志文本（不拉设备时使用）")
+
+
+class ServiceLogsRequest(BaseModel):
+    service: str = Field(..., min_length=1, description="订单号或 serviceId")
 
 
 @app.get("/")
 def index() -> FileResponse:
+    """订单查询（按订单号 / serviceId 拉取报文）— 默认首页。"""
     return FileResponse(
         WEB_DIR / "index.html",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+@app.get("/device")
+def device_page() -> FileResponse:
+    """设备报文（按设备编号 + 时间窗拉取）。"""
+    return FileResponse(
+        WEB_DIR / "device.html",
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
 
@@ -135,6 +152,7 @@ def history_logs(req: HistoryLogsRequest, _user: RequireUser) -> dict[str, Any]:
             cmd=req.cmd,
             is_send_log=req.is_send_log,
             sort_type=req.sort_type,
+            limit_count=req.limit_count,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -159,6 +177,40 @@ def history_logs(req: HistoryLogsRequest, _user: RequireUser) -> dict[str, Any]:
     }
 
 
+@app.post("/service-logs")
+def service_logs(req: ServiceLogsRequest, _user: RequireUser) -> dict[str, Any]:
+    """按订单号 / serviceId 代理拉取报文，拼成文本供页面展示；不自动分析。"""
+    try:
+        remote = fetch_service_logs(service=req.service)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+    code = remote.get("code")
+    msg = remote.get("msg")
+    items = remote.get("data")
+    if not isinstance(items, list):
+        items = []
+    text = logs_to_text(items)
+    ok = code in (0, "0", 1, "1", 200, "200", None) or bool(items)
+    # 上游可能在顶层或首条日志里返回 serviceId，用于回填筛选
+    service_id = remote.get("serviceId") or remote.get("service_id")
+    if not service_id and items:
+        first = items[0] if isinstance(items[0], dict) else {}
+        service_id = first.get("serviceId") or first.get("service_id")
+    return {
+        "ok": bool(ok),
+        "code": code,
+        "msg": msg,
+        "count": len(items),
+        "logs": items,
+        "text": text,
+        "service": (req.service or "").strip(),
+        "service_id": str(service_id) if service_id not in (None, "") else None,
+    }
+
+
 @app.post("/card-auth-query")
 def card_auth_query(req: CardAuthQueryRequest, _user: RequireUser) -> dict[str, Any]:
     """拉取或解析设备报文，提取刷卡/VIN 启动卡号及失败原因。"""
@@ -177,6 +229,7 @@ def card_auth_query(req: CardAuthQueryRequest, _user: RequireUser) -> dict[str, 
                 cmd=req.cmd,
                 is_send_log=req.is_send_log,
                 sort_type=req.sort_type,
+                limit_count=req.limit_count,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
