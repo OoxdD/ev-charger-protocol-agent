@@ -3,13 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>充电桩报文分析</title>
+  <title>刷卡 / VIN 卡号查询 · 充电桩报文分析</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/styles.css?v=20260805-5050" />
 </head>
-<body>
+<body class="page-cards">
   <div class="bg" aria-hidden="true"></div>
 
   <div id="loginGate" class="login-gate" hidden>
@@ -46,7 +46,7 @@
           <div class="brand-text">
             <p class="brand-kicker">EV Protocol Agent</p>
             <h1>充电桩报文分析</h1>
-            <p class="tagline">拉取设备日志 · 识别协议 · 输出可转发的研判结论</p>
+            <p class="tagline">查询刷卡与 VIN 启动卡号，失败时显示原因</p>
           </div>
         </div>
         <div class="top-aside">
@@ -58,8 +58,8 @@
         </div>
       </div>
       <nav class="page-nav" aria-label="页面切换">
-        <a class="page-nav-link active" href="/" aria-current="page">报文分析</a>
-        <a class="page-nav-link" href="/cards">卡号查询</a>
+        <a class="page-nav-link" href="/">报文分析</a>
+        <a class="page-nav-link active" href="/cards" aria-current="page">卡号查询</a>
       </nav>
     </header>
 
@@ -67,21 +67,12 @@
       <section class="panel input-panel">
         <div class="panel-head">
           <div>
-            <p class="step-label">步骤 1–2</p>
-            <h2>输入报文</h2>
-          </div>
-          <div class="tabs" role="tablist">
-            <button type="button" class="tab active" data-mode="auto">自动识别</button>
-            <button type="button" class="tab" data-mode="hex">十六进制</button>
-            <button type="button" class="tab" data-mode="json">JSON</button>
+            <p class="step-label">查询条件</p>
+            <h2>拉取设备报文</h2>
           </div>
         </div>
 
-        <details class="fetch-box" open>
-          <summary>
-            <span class="step-badge">1</span>
-            <span>从设备拉取报文</span>
-          </summary>
+        <div class="fetch-box fetch-box-plain">
           <div class="fetch-grid">
             <label class="field">
               <span>设备编号 deviceNo *</span>
@@ -115,99 +106,47 @@
             </label>
           </div>
           <div class="actions fetch-actions">
-            <button type="button" class="btn accent" id="fetchBtn">拉取报文</button>
-            <p class="hint inline" id="fetchHint">拉取后先展示在下方，确认后再分析。</p>
-            <button type="button" class="btn ghost fetch-download" id="downloadPayloadBtn">下载报文</button>
+            <button type="button" class="btn accent" id="queryBtn">查询卡号</button>
+            <p class="hint inline" id="fetchHint">将解析刷卡启动与 VIN 启动的卡号；失败会附带原因。</p>
+          </div>
+        </div>
+
+        <details class="payload-details">
+          <summary>高级：粘贴报文文本查询</summary>
+          <label class="field grow">
+            <span>报文内容</span>
+            <textarea id="payload" spellcheck="false" placeholder="也可粘贴平台日志，不填设备编号时直接从此文本解析"></textarea>
+          </label>
+          <div class="actions">
+            <button type="button" class="btn ghost" id="parseTextBtn">从文本解析</button>
+            <button type="button" class="btn ghost" id="clearBtn">清空</button>
           </div>
         </details>
-
-        <div class="section-divider">
-          <span class="step-badge">2</span>
-          <span>报文与筛选</span>
-        </div>
-
-        <div class="filter-row">
-          <label class="field">
-            <span>协议（可选强制）</span>
-            <select id="protocol">
-              <option value="">自动识别</option>
-            </select>
-          </label>
-          <label class="field">
-            <span>服务ID / 流水号（可选）</span>
-            <input type="text" id="orderFilter" placeholder="多枪/多订单时用于筛选" autocomplete="off" />
-          </label>
-        </div>
-
-        <label class="field grow">
-          <span>报文内容</span>
-          <textarea id="payload" spellcheck="false" placeholder="粘贴平台订单日志，或使用上方拉取设备历史报文&#10;&#10;支持 socInfo / chargingInfo / recordInfo 等业务日志，以及十六进制 / JSON 协议帧"></textarea>
-        </label>
-
-        <div class="actions sticky-actions">
-          <label class="file-btn">
-            <input type="file" id="file" accept=".hex,.json,.txt,.log,.csv,text/plain,application/json" />
-            导入文件
-          </label>
-          <button type="button" class="btn ghost" id="clearBtn">清空</button>
-          <button type="button" class="btn primary" id="analyzeBtn">开始分析</button>
-        </div>
-        <p class="hint" id="fileHint"></p>
       </section>
 
       <section class="panel result-panel">
         <div class="panel-head">
           <div>
-            <p class="step-label">步骤 3</p>
-            <h2>分析结果</h2>
-          </div>
-          <div class="panel-actions">
-            <button type="button" class="btn ghost small" id="downloadReportBtn" hidden>下载解析报告</button>
-            <button type="button" class="btn ghost small" id="copyBtn" hidden>分享结果</button>
+            <p class="step-label">查询结果</p>
+            <h2>卡号列表</h2>
           </div>
         </div>
 
         <div id="emptyState" class="empty">
           <div class="empty-illus" aria-hidden="true"></div>
-          <p class="empty-title">等待分析</p>
+          <p class="empty-title">等待查询</p>
           <ol class="empty-steps">
-            <li>填写设备编号与起止时间，拉取报文</li>
-            <li>核对左侧报文内容（可再筛服务ID）</li>
-            <li>点击「开始分析」查看结论</li>
+            <li>填写设备编号与起止时间</li>
+            <li>点击「查询卡号」拉取并解析</li>
+            <li>失败项会显示原因与卡号</li>
           </ol>
         </div>
 
         <div id="errorState" class="error" hidden></div>
 
         <div id="resultView" hidden>
-          <div class="block">
-            <h3>结果</h3>
-            <div id="resultPoints" class="result-points"></div>
-            <p id="verdictText" class="verdict-text"></p>
-          </div>
-          <div class="block">
-            <h3>充电信息</h3>
-            <div class="summary-grid" id="summaryGrid"></div>
-            <div class="table-wrap info-table">
-              <table>
-                <thead>
-                  <tr>
-                    <th>项目</th>
-                    <th>数值</th>
-                  </tr>
-                </thead>
-                <tbody id="fieldBody"></tbody>
-              </table>
-            </div>
-          </div>
-          <div class="block" id="warnBlock" hidden>
-            <h3>告警 / 问题</h3>
-            <ul id="warnList"></ul>
-          </div>
-          <div class="block" id="candBlock" hidden>
-            <h3 id="candTitle">协议候选得分</h3>
-            <div class="cands" id="candList"></div>
-          </div>
+          <div class="summary-grid" id="summaryGrid"></div>
+          <div class="card-event-list" id="eventBody"></div>
         </div>
       </section>
     </main>
@@ -216,6 +155,6 @@
       <span>本地分析服务 · 数据不上传第三方</span>
     </footer>
   </div>
-  <script src="/static/app.js?v=20260805-fetch-nosort"></script>
+  <script src="/static/cards.js?v=20260805-nocopy"></script>
 </body>
 </html>

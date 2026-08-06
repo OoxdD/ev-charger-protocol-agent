@@ -17,6 +17,7 @@ from evcpa.auth import (
     set_session_cookie,
     verify_password,
 )
+from evcpa.card_query import extract_card_auth_events, summarize_card_auth
 from evcpa.history_logs import fetch_device_history_logs, logs_to_text
 from evcpa.order_report import analyze_order_log, looks_like_order_log
 
@@ -46,11 +47,11 @@ class AnalyzeRequest(BaseModel):
 
 class HistoryLogsRequest(BaseModel):
     device_no: str = Field(..., description="设备编号 deviceNo")
-    start_time: int = Field(..., description="开始时间戳（毫秒）")
+    start_time: int = Field(..., description="开始时间戳（毫秒）；上游查询会再往前 1 分钟")
+    end_time: int = Field(..., description="结束时间戳（毫秒）；上游查询会再往后 3 分钟")
     cmd: Optional[str] = Field(None, description="报文命令，可选")
     is_send_log: Optional[int] = Field(None, description="1=只查下行，0=上行，不传=全部")
     sort_type: Optional[int] = Field(1, description="排序，默认1正序，<0倒序")
-    limit_count: Optional[int] = Field(1000, description="最大条数，默认1000，最长15000")
 
 
 class LoginRequest(BaseModel):
@@ -58,10 +59,28 @@ class LoginRequest(BaseModel):
     password: str = Field(..., min_length=1)
 
 
+class CardAuthQueryRequest(BaseModel):
+    device_no: Optional[str] = Field(None, description="设备编号；与 text 二选一，优先拉取设备报文")
+    start_time: Optional[int] = Field(None, description="开始时间戳（毫秒）")
+    end_time: Optional[int] = Field(None, description="结束时间戳（毫秒）")
+    cmd: Optional[str] = Field(None, description="报文命令，可选")
+    is_send_log: Optional[int] = Field(None, description="1=只查下行，0=上行，不传=全部")
+    sort_type: Optional[int] = Field(1, description="排序，默认1正序")
+    text: Optional[str] = Field(None, description="直接粘贴的平台日志文本（不拉设备时使用）")
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(
         WEB_DIR / "index.html",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+@app.get("/cards")
+def cards_page() -> FileResponse:
+    return FileResponse(
+        WEB_DIR / "cards.html",
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
 
@@ -112,10 +131,10 @@ def history_logs(req: HistoryLogsRequest, _user: RequireUser) -> dict[str, Any]:
         remote = fetch_device_history_logs(
             device_no=req.device_no,
             start_time=req.start_time,
+            end_time=req.end_time,
             cmd=req.cmd,
             is_send_log=req.is_send_log,
             sort_type=req.sort_type,
-            limit_count=req.limit_count,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -137,6 +156,63 @@ def history_logs(req: HistoryLogsRequest, _user: RequireUser) -> dict[str, Any]:
         "count": len(items),
         "logs": items,
         "text": text,
+    }
+
+
+@app.post("/card-auth-query")
+def card_auth_query(req: CardAuthQueryRequest, _user: RequireUser) -> dict[str, Any]:
+    """拉取或解析设备报文，提取刷卡/VIN 启动卡号及失败原因。"""
+    text = (req.text or "").strip()
+    fetch_meta: dict[str, Any] = {}
+
+    device_no = (req.device_no or "").strip()
+    if device_no:
+        if req.start_time is None or req.end_time is None:
+            raise HTTPException(status_code=400, detail="拉取设备报文时需提供 start_time 与 end_time")
+        try:
+            remote = fetch_device_history_logs(
+                device_no=device_no,
+                start_time=req.start_time,
+                end_time=req.end_time,
+                cmd=req.cmd,
+                is_send_log=req.is_send_log,
+                sort_type=req.sort_type,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+
+        code = remote.get("code")
+        msg = remote.get("msg")
+        items = remote.get("data")
+        if not isinstance(items, list):
+            items = []
+        text = logs_to_text(items)
+        ok = code in (0, "0", 1, "1", 200, "200", None) or bool(items)
+        fetch_meta = {
+            "ok": bool(ok),
+            "code": code,
+            "msg": msg,
+            "count": len(items),
+        }
+
+    if not text:
+        return {
+            "ok": True,
+            "events": [],
+            "summary": summarize_card_auth([]),
+            "text": "",
+            "fetch": fetch_meta or None,
+        }
+
+    events = extract_card_auth_events(text)
+    return {
+        "ok": True,
+        "events": events,
+        "summary": summarize_card_auth(events),
+        "text": text,
+        "fetch": fetch_meta or None,
     }
 
 

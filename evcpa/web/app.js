@@ -18,8 +18,9 @@
   const fetchStartDate = $("fetchStartDate");
   const fetchStartHour = $("fetchStartHour");
   const fetchStartMinute = $("fetchStartMinute");
-  const fetchLimit = $("fetchLimit");
-  const fetchSort = $("fetchSort");
+  const fetchEndDate = $("fetchEndDate");
+  const fetchEndHour = $("fetchEndHour");
+  const fetchEndMinute = $("fetchEndMinute");
   const fetchCmd = $("fetchCmd");
   const fetchDirection = $("fetchDirection");
   const emptyState = $("emptyState");
@@ -667,52 +668,70 @@
     return String(n).padStart(2, "0");
   }
 
-  function fillTimeSelects() {
-    if (!fetchStartHour || !fetchStartMinute) return;
-    if (!fetchStartHour.options.length) {
+  function fillHourMinuteSelects(hourSel, minuteSel) {
+    if (!hourSel || !minuteSel) return;
+    if (!hourSel.options.length) {
       for (let h = 0; h < 24; h += 1) {
         const opt = document.createElement("option");
         opt.value = String(h);
         opt.textContent = pad2(h);
-        fetchStartHour.appendChild(opt);
+        hourSel.appendChild(opt);
       }
     }
-    if (!fetchStartMinute.options.length) {
+    if (!minuteSel.options.length) {
       for (let m = 0; m < 60; m += 1) {
         const opt = document.createElement("option");
         opt.value = String(m);
         opt.textContent = pad2(m);
-        fetchStartMinute.appendChild(opt);
+        minuteSel.appendChild(opt);
       }
     }
+  }
+
+  function fillTimeSelects() {
+    fillHourMinuteSelects(fetchStartHour, fetchStartMinute);
+    fillHourMinuteSelects(fetchEndHour, fetchEndMinute);
   }
 
   function setDefaultFetchTime() {
     fillTimeSelects();
     const now = new Date();
-    if (fetchStartDate && !fetchStartDate.value) {
-      fetchStartDate.value = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
-    }
-    if (fetchStartHour) fetchStartHour.value = String(now.getHours());
-    if (fetchStartMinute) fetchStartMinute.value = String(now.getMinutes());
+    const dateStr = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
+    const h = String(now.getHours());
+    const m = String(now.getMinutes());
+    if (fetchStartDate && !fetchStartDate.value) fetchStartDate.value = dateStr;
+    if (fetchStartHour) fetchStartHour.value = h;
+    if (fetchStartMinute) fetchStartMinute.value = m;
+    if (fetchEndDate && !fetchEndDate.value) fetchEndDate.value = dateStr;
+    if (fetchEndHour) fetchEndHour.value = h;
+    if (fetchEndMinute) fetchEndMinute.value = m;
   }
 
-  function toStartTimeUnixMs() {
+  function toUnixMs(dateEl, hourEl, minuteEl) {
     // 日期 + 时 + 分 → 本地毫秒时间戳
-    const date = fetchStartDate && fetchStartDate.value;
+    const date = dateEl && dateEl.value;
     if (!date) return null;
-    const h = Number(fetchStartHour && fetchStartHour.value);
-    const m = Number(fetchStartMinute && fetchStartMinute.value);
+    const h = Number(hourEl && hourEl.value);
+    const m = Number(minuteEl && minuteEl.value);
     if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
     const ms = Date.parse(`${date}T${pad2(h)}:${pad2(m)}:00`);
     if (Number.isNaN(ms)) return null;
     return ms;
   }
 
+  function toStartTimeUnixMs() {
+    return toUnixMs(fetchStartDate, fetchStartHour, fetchStartMinute);
+  }
+
+  function toEndTimeUnixMs() {
+    return toUnixMs(fetchEndDate, fetchEndHour, fetchEndMinute);
+  }
+
   async function fetchHistoryLogs() {
     if (!fetchBtn) return;
     const deviceNo = (fetchDeviceNo && fetchDeviceNo.value || "").trim();
     const startMs = toStartTimeUnixMs();
+    const endMs = toEndTimeUnixMs();
     if (!deviceNo) {
       if (fetchHint) fetchHint.textContent = "请填写设备编号 deviceNo。";
       return;
@@ -721,15 +740,20 @@
       if (fetchHint) fetchHint.textContent = "请选择开始日期与时刻。";
       return;
     }
-    const limit = Number((fetchLimit && fetchLimit.value) || 1000);
-    const sortType = Number((fetchSort && fetchSort.value) || 1);
+    if (endMs == null) {
+      if (fetchHint) fetchHint.textContent = "请选择结束日期与时刻。";
+      return;
+    }
+    if (endMs < startMs) {
+      if (fetchHint) fetchHint.textContent = "结束时间不能早于开始时间。";
+      return;
+    }
     const cmd = (fetchCmd && fetchCmd.value || "").trim();
     const dirRaw = fetchDirection && fetchDirection.value;
     const body = {
       device_no: deviceNo,
       start_time: startMs,
-      sort_type: sortType,
-      limit_count: Math.min(15000, Math.max(1, limit || 1000)),
+      end_time: endMs,
     };
     if (cmd) body.cmd = cmd;
     if (dirRaw !== "" && dirRaw != null) body.is_send_log = Number(dirRaw);
@@ -756,7 +780,7 @@
       if (fetchHint) {
         fetchHint.textContent = count
           ? `已拉取 ${count} 条报文${msg}，已填入下方文本框。确认后点击「开始分析」。`
-          : `未查到报文${msg}。请调整设备编号或开始时间后重试。`;
+          : `未查到报文${msg}。请调整设备编号或起止时间后重试。`;
       }
       if (fileHint) fileHint.textContent = count ? `来源：设备历史报文（${count} 条）` : "";
       showEmpty();

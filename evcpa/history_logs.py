@@ -12,6 +12,10 @@ from typing import Any
 DEFAULT_HISTORY_URL = "http://172.16.1.94:9138/Device/historyLogs"
 DEFAULT_HISTORY_SKEY = "B7674FBA87FBB806ED98D1CD3EADDAA2"
 
+# 查询窗口外扩：开始时间往前 1 分钟，结束时间往后 3 分钟
+_START_PAD_MS = 60_000
+_END_PAD_MS = 3 * 60_000
+
 
 def history_logs_config() -> tuple[str, str]:
     url = (os.environ.get("EVCPA_HISTORY_LOGS_URL") or DEFAULT_HISTORY_URL).rstrip("?")
@@ -23,25 +27,34 @@ def fetch_device_history_logs(
     *,
     device_no: str,
     start_time: int,
+    end_time: int,
     cmd: str | None = None,
     is_send_log: int | None = None,
     sort_type: int | None = 1,
-    limit_count: int | None = 1000,
     timeout_sec: float = 30.0,
 ) -> dict[str, Any]:
     """调用外部接口拉取设备历史报文。
 
-    startTime 使用毫秒级时间戳（如 1785296760000）。
+    startTime / endTime 使用毫秒级时间戳（如 1785296760000）。
+    实际上游传参：startTime 往前 1 分钟，endTime 往后 3 分钟；不传 limitCount。
     """
     device_no = (device_no or "").strip()
     if not device_no:
         raise ValueError("deviceNo 不能为空")
     if start_time is None:
         raise ValueError("startTime 不能为空")
+    if end_time is None:
+        raise ValueError("endTime 不能为空")
+
+    start_ms = int(start_time)
+    end_ms = int(end_time)
+    if end_ms < start_ms:
+        raise ValueError("endTime 不能早于 startTime")
 
     body: dict[str, Any] = {
         "deviceNo": device_no,
-        "startTime": int(start_time),
+        "startTime": start_ms - _START_PAD_MS,
+        "endTime": end_ms + _END_PAD_MS,
         "isHexLog": 0,
     }
     if cmd not in (None, ""):
@@ -50,8 +63,6 @@ def fetch_device_history_logs(
         body["isSendLog"] = int(is_send_log)
     if sort_type is not None:
         body["sortType"] = int(sort_type)
-    if limit_count is not None:
-        body["limitCount"] = int(limit_count)
 
     base_url, skey = history_logs_config()
     sep = "&" if "?" in base_url else "?"

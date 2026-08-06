@@ -33,6 +33,60 @@ def _parse_gun_statuses(ln: str) -> list[tuple[str, str]]:
     return _GUN_STATUS.findall(ln)
 
 
+def _collect_status_gun_ids(lines: list[str]) -> set[str]:
+    """扫描日志中出现的状态行枪号（「N枪：CHARGING」中的 N）。"""
+    guns: set[str] = set()
+    for ln in lines:
+        for g, _st in _parse_gun_statuses(ln):
+            guns.add(str(g))
+    return guns
+
+
+def _iface_to_status_gun(iface: str | None, status_guns: set[str]) -> str | None:
+    """平台 interfaceCode → 状态行枪号。
+
+    常见两套编号：
+    - 与 interfaceCode 一致：1枪 = interfaceCode 1
+    - 0 起始：0枪 = interfaceCode 1，1枪 = interfaceCode 2
+
+    若日志出现「0枪」，且减一后的编号落在状态枪号集合中，则按 0 起始映射；
+    否则保持 interfaceCode 原值（兼容既有 1 起始桩日志）。
+    """
+    if iface in (None, "", "-"):
+        return None
+    raw = str(iface).strip()
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return raw
+    s = str(n)
+    if not status_guns:
+        return s
+    # 明确 1 起始：无 0枪，且本 interfaceCode 直接出现在状态行
+    if "0" not in status_guns and s in status_guns:
+        return s
+    if "0" in status_guns:
+        mapped = str(n - 1) if n >= 1 else s
+        if mapped in status_guns:
+            return mapped
+        if s in status_guns:
+            return s
+        return mapped
+    return s
+
+
+def _status_guns_for_ifaces(iface_guns: set[str], status_guns: set[str]) -> set[str]:
+    """把订单侧 interfaceCode 集合映射为状态行过滤用枪号集合。"""
+    out: set[str] = set()
+    for g in iface_guns:
+        if not g or g == "-":
+            continue
+        sg = _iface_to_status_gun(g, status_guns)
+        if sg is not None:
+            out.add(sg)
+    return out
+
+
 _ALARM_CODE_CONTENT = re.compile(
     r"告警上报[，,]\s*告警码[：:]\s*(\d+)\s+内容[：:]\s*(.+?)(?:\s*$|\s*[\[【])"
 )
@@ -98,6 +152,57 @@ def _extract_start_result_phrase(ln: str) -> str | None:
     if phrase.startswith("启动失败") or phrase.startswith("启动成功"):
         return phrase
     return None
+
+
+def _start_phrase_gun(phrase: str | None) -> str | None:
+    """从启动结果文案提取枪号，如「启动失败，2 枪口未插枪」→「2」。"""
+    if not phrase:
+        return None
+    m = re.search(r"(\d+)\s*枪", phrase)
+    return m.group(1) if m else None
+
+
+def _filter_start_result_events(
+    events: list[tuple[str, str]],
+    *,
+    iface_gun: str | None = None,
+    status_gun: str | None = None,
+    session_start: str | None = None,
+    session_end: str | None = None,
+) -> list[str]:
+    """只保留归属本单枪口、且落在本单会话时间窗内的启动结果。
+
+    拔枪/结算后的他单启动失败/成功不得污染本单。
+    """
+    from datetime import timedelta
+
+    exact: set[str] = set()
+    for g in (iface_gun, status_gun):
+        if g not in (None, "", "-"):
+            exact.add(str(g).strip())
+    start_dt = _parse_event_ts((session_start or "")[:19] or None)
+    end_dt = _parse_event_ts((session_end or "")[:19] or None)
+    # 启动失败文案偶发略晚于拔枪/结算，结束侧放宽 2 分钟
+    if end_dt is not None:
+        end_dt = end_dt + timedelta(minutes=2)
+    out: list[str] = []
+    seen: set[str] = set()
+    for ts, phrase in events:
+        if not phrase:
+            continue
+        pg = _start_phrase_gun(phrase)
+        if pg is not None and exact and pg not in exact:
+            continue
+        kt = _parse_event_ts((ts or "")[:19] or None)
+        if start_dt and kt and kt < start_dt - timedelta(minutes=3):
+            continue
+        if end_dt and kt and kt > end_dt:
+            continue
+        if phrase in seen:
+            continue
+        seen.add(phrase)
+        out.append(phrase)
+    return out
 
 
 def _alarm_code_meaningful(raw: Any) -> bool:
@@ -796,13 +901,55 @@ def _parse_event_ts(ts: str | None) -> datetime | None:
         return None
 
 
+def _filter_gun_events_for_session(
+    gun_events: list[tuple[str, str, str]],
+    gun: str | None,
+    start_iso: str | None,
+    end_iso: str | None,
+    *,
+    pre_margin_sec: int = 180,
+    post_margin_sec: int = 600,
+) -> list[tuple[str, str, str]]:
+    """按本单枪号与起止时间窗过滤状态事件，避免同枪上一单/下一单串段。"""
+    from datetime import timedelta
+
+    start_dt = _parse_event_ts((start_iso or "")[:19] or None)
+    end_dt = _parse_event_ts((end_iso or "")[:19] or None)
+    lo = (
+        (start_dt - timedelta(seconds=pre_margin_sec)).strftime("%Y-%m-%d %H:%M:%S")
+        if start_dt
+        else ""
+    )
+    hi = (
+        (end_dt + timedelta(seconds=post_margin_sec)).strftime("%Y-%m-%d %H:%M:%S")
+        if end_dt
+        else ""
+    )
+    out: list[tuple[str, str, str]] = []
+    for ts, g, st in gun_events:
+        if gun not in (None, "", "-") and str(g) != str(gun):
+            continue
+        key = (ts or "")[:19]
+        if lo and key and key < lo:
+            continue
+        if hi and key and key > hi:
+            continue
+        out.append((ts, g, st))
+    return out
+
+
 def _charging_duration_from_gun_events(
     gun_events: list[tuple[str, str, str]],
     gun: str | None,
+    *,
+    session_start: str | None = None,
+    session_end: str | None = None,
 ) -> tuple[int | None, str | None, str | None]:
     """按枪口处于 CHARGING 的时段累计实际充电时长。
 
     离开 CHARGING（如变为 OCCUPYING）即结束该段计时；多段 CHARGING 累加。
+    若日志从充电中途开始（首条已是 CHARGING），可用 session_start 回补起点；
+    若结尾仍停在 CHARGING 且提供 session_end，则闭合到会话结束（避免截断漏计）。
     返回 (秒数, 首次进入CHARGING时间, 最后离开CHARGING时间)。
     """
     seq = _gun_status_sequence(gun_events, gun or "")
@@ -812,6 +959,9 @@ def _charging_duration_from_gun_events(
         for ts, _g, st in gun_events:
             if not seq or seq[-1][1] != st:
                 seq.append((ts, st))
+
+    sess_start_dt = _parse_event_ts((session_start or "")[:19] or None)
+    sess_end_dt = _parse_event_ts((session_end or "")[:19] or None)
 
     total = 0.0
     charging_since: datetime | None = None
@@ -823,15 +973,28 @@ def _charging_duration_from_gun_events(
             continue
         if st == "CHARGING":
             if charging_since is None:
-                charging_since = t
-                if first_charge is None:
-                    first_charge = ts[:19] if ts else None
+                # 日志中途切入：首条已是 CHARGING，用订单开始时间回补
+                if (
+                    first_charge is None
+                    and sess_start_dt is not None
+                    and sess_start_dt < t
+                ):
+                    charging_since = sess_start_dt
+                    first_charge = session_start[:19] if session_start else ts[:19]
+                else:
+                    charging_since = t
+                    if first_charge is None:
+                        first_charge = ts[:19] if ts else None
         else:
             if charging_since is not None:
                 total += max(0.0, (t - charging_since).total_seconds())
                 last_leave = ts[:19] if ts else last_leave
                 charging_since = None
-    # 若日志截断时仍停在 CHARGING，不计开放区间（避免虚高）
+    # 结尾仍在 CHARGING：有会话结束时间则闭合，否则不计开放区间（避免虚高）
+    if charging_since is not None and sess_end_dt is not None and sess_end_dt >= charging_since:
+        total += max(0.0, (sess_end_dt - charging_since).total_seconds())
+        last_leave = session_end[:19] if session_end else last_leave
+        charging_since = None
     if total <= 0:
         return None, first_charge, last_leave
     return int(round(total)), first_charge, last_leave
@@ -1813,8 +1976,9 @@ def _check_start_success(
 
     has_process = has_vi or has_energy
 
-    # 日志已有明确启动失败文案（含「远程启动结果返回 code≠0」）时直接输出，不因短暂 CHARGING 误判成功
-    if fail_msgs:
+    # 明确启动失败：无实质充电过程时直接失败；
+    # 已有过程电量+CHARGING 则视为本单已成功启动（会话外失败文案不应覆盖）
+    if fail_msgs and not (has_energy and charging_hits):
         uniq: list[str] = []
         for m in fail_msgs:
             if m not in uniq:
@@ -2324,6 +2488,7 @@ def analyze_order_log(
     alarm_notes: list[str] = []
     platform_guard_msg: str | None = None
     start_result_msgs: list[str] = []
+    start_result_events: list[tuple[str, str]] = []
     other_gun_notes: list[str] = []
     matched_guns: set[str] = set()
     matched_trade_nos: set[str] = set()
@@ -2402,6 +2567,9 @@ def analyze_order_log(
 
     # 第二遍：状态行 / 启停标记，按已匹配流水或枪口过滤
     matched_guns.discard("")
+    # 状态行枪号可能为 0 起始，与 interfaceCode(常从 1 起)不一致，先映射再过滤
+    status_gun_ids = _collect_status_gun_ids(lines)
+    matched_status_guns = _status_guns_for_ifaces(matched_guns, status_gun_ids)
     match_tokens = set(matched_trade_nos)
     if sid:
         match_tokens.add(sid)
@@ -2462,10 +2630,13 @@ def analyze_order_log(
                 note = f"{ts + '　' if ts else ''}{guard}"
                 if note not in fault_notes:
                     fault_notes.append(note)
-        # 中文启动结果（启动失败/成功）常无 serviceId，按桩级事件收录并原样输出
+        # 中文启动结果：带时间戳收录，稍后按本单枪口+会话窗过滤
         start_phrase = _extract_start_result_phrase(ln)
-        if start_phrase and start_phrase not in start_result_msgs:
-            start_result_msgs.append(start_phrase)
+        if start_phrase:
+            ts = ts_m.group(1) if (ts_m := _TS.match(ln.strip())) else ""
+            start_result_events.append((ts, start_phrase))
+            if start_phrase not in start_result_msgs:
+                start_result_msgs.append(start_phrase)
         if "故障" in ln and "枪" in ln and related:
             # 尽量绑定本单枪口；无法识别枪号时仍记入本单异常摘录
             statuses = _parse_gun_statuses(ln)
@@ -2473,7 +2644,8 @@ def analyze_order_log(
             if not gun_hit:
                 gm_fault = re.search(r"(\d+)\s*枪", ln)
                 gun_hit = gm_fault.group(1) if gm_fault else ""
-            if (not matched_guns) or (not gun_hit) or (gun_hit in matched_guns):
+            status_filter = matched_status_guns or matched_guns
+            if (not status_filter) or (not gun_hit) or (gun_hit in status_filter):
                 fault = True
                 ts = ts_m.group(1) if (ts_m := _TS.match(ln.strip())) else ""
                 snippet = ln.strip()
@@ -2482,8 +2654,9 @@ def analyze_order_log(
                 fault_notes.append(f"{ts + '　' if ts else ''}{snippet}")
         ts_m = _TS.match(ln.strip())
         for gun_no, st in _parse_gun_statuses(ln):
-            # 仅收录本单已匹配枪口，避免同桩其他枪 TROUBLE 污染本单
-            gun_ok = (not matched_guns) or (gun_no in matched_guns)
+            # 仅收录本单已匹配枪口（按状态行编号），避免同桩其他枪 TROUBLE 污染本单
+            status_filter = matched_status_guns or matched_guns
+            gun_ok = (not status_filter) or (gun_no in status_filter)
             if gun_ok:
                 gun_events.append((ts_m.group(1) if ts_m else "", gun_no, st))
                 if st == "TROUBLE":
@@ -2581,6 +2754,8 @@ def analyze_order_log(
     src = record or bill or (chgs[-1] if chgs else {}) or data
     if isinstance(src, dict) and src.get("interfaceCode") is not None and (gun == "-" or not gun):
         gun = str(src.get("interfaceCode"))
+    # 状态行匹配用枪号（可能相对 interfaceCode 减一）；展示仍用平台 interfaceCode
+    status_gun = _iface_to_status_gun(gun, status_gun_ids) or (gun if gun not in (None, "", "-") else None)
     if isinstance(src, dict) and src.get("deviceNo"):
         device_no = str(src.get("deviceNo"))
     service_id_val = str(
@@ -2761,15 +2936,36 @@ def analyze_order_log(
     if isinstance(src, dict) and src.get("startWay") is None and isinstance(bill, dict) and bill.get("startWay") is not None:
         src = {**src, "startWay": bill.get("startWay"), "carvin": src.get("carvin") or bill.get("carvin")}
 
+    # 先取账单/结算起止，再按本单时间窗裁剪枪状态（避免同枪多单串段）
+    order_start_ts = "-"
+    order_end_ts = "-"
+    for obj in (bill, record, src if isinstance(src, dict) else None):
+        if not isinstance(obj, dict):
+            continue
+        st = _parse_log_time(obj.get("startTime"))
+        et = _parse_log_time(obj.get("endTime"))
+        if st and order_start_ts == "-":
+            order_start_ts = st
+        if et and order_end_ts == "-":
+            order_end_ts = et
+        if order_start_ts != "-" and order_end_ts != "-":
+            break
+    gun_events = _filter_gun_events_for_session(
+        gun_events,
+        status_gun,
+        order_start_ts if order_start_ts != "-" else None,
+        order_end_ts if order_end_ts != "-" else None,
+    )
+
     # 充电结束拔枪后：本枪后续状态/故障/异常与本单脱钩
-    unplug_ts = _first_idle_after_charging(gun_events, gun)
-    gun_events = _clip_gun_events_after_unplug(gun_events, gun)
+    unplug_ts = _first_idle_after_charging(gun_events, status_gun)
+    gun_events = _clip_gun_events_after_unplug(gun_events, status_gun)
     fault_notes = _filter_notes_before_ts(fault_notes, unplug_ts)
     alarm_notes = _filter_notes_before_ts(alarm_notes, unplug_ts)
     for ts, gun_no, st in gun_events:
         if st != "TROUBLE":
             continue
-        if gun not in (None, "", "-") and str(gun_no) != str(gun):
+        if status_gun not in (None, "", "-") and str(gun_no) != str(status_gun):
             continue
         if _trouble_followed_by_charging(gun_events, gun_no):
             continue
@@ -2779,7 +2975,12 @@ def analyze_order_log(
     fault = bool(fault_notes)
 
     # 充电过程短时离线重连：一两分钟内且电量/费用连续 → 正常，不告警
-    _cdur, _cfirst, _clast = _charging_duration_from_gun_events(gun_events, gun)
+    _cdur, _cfirst, _clast = _charging_duration_from_gun_events(
+        gun_events,
+        status_gun,
+        session_start=order_start_ts if order_start_ts != "-" else None,
+        session_end=order_end_ts if order_end_ts != "-" else None,
+    )
     _offline_scale = _accuracy_scale(chgs[-1] if chgs else None, 1000)
     offline_info = _classify_mid_charge_offline(
         offline_events=offline_events,
@@ -2805,7 +3006,7 @@ def analyze_order_log(
         finish_msg=None if finish_msg == "-" else finish_msg,
         finish_code=finish_code,
         gun_events=gun_events,
-        gun=gun,
+        gun=status_gun,
         offline_reconnect=finish_is_offline or offline_alarm,
         alarm_notes=alarm_notes,
         platform_guard_msg=platform_guard_msg,
@@ -2814,12 +3015,14 @@ def analyze_order_log(
     need_user_confirm = stop_info["category"] in {"estop_suspect", "gun_fault"}
 
     # 时间：账单 BCD → 结算/账单 unix/ISO → 枪状态行
-    start_time = "-"
-    end_time = "-"
+    start_time = order_start_ts
+    end_time = order_end_ts
     ready_ts = ""
     charge_start_ts = ""
     charge_end_ts = ""
     for ts, g, st in gun_events:
+        if status_gun not in (None, "", "-") and str(g) != str(status_gun):
+            continue
         if st == "READY_CHARGE" and not ready_ts:
             ready_ts = ts
         if st == "CHARGING":
@@ -2827,17 +3030,6 @@ def analyze_order_log(
                 charge_start_ts = ts
             charge_end_ts = ts
 
-    for obj in (bill, record, src if isinstance(src, dict) else None):
-        if not isinstance(obj, dict):
-            continue
-        st = _parse_log_time(obj.get("startTime"))
-        et = _parse_log_time(obj.get("endTime"))
-        if st and start_time == "-":
-            start_time = st
-        if et and end_time == "-":
-            end_time = et
-        if start_time != "-" and end_time != "-":
-            break
     if start_time == "-" and charge_start_ts:
         start_time = charge_start_ts[:19]
     if end_time == "-" and charge_end_ts:
@@ -2845,7 +3037,12 @@ def analyze_order_log(
 
     # 时长：优先按枪口 CHARGING 时段累计（OCCUPYING 等不算充电）；
     # 其次平台 chargeDuration；最后用订单起止时间差。
-    charge_dur, charge_first, charge_last = _charging_duration_from_gun_events(gun_events, gun)
+    charge_dur, charge_first, charge_last = _charging_duration_from_gun_events(
+        gun_events,
+        status_gun,
+        session_start=start_time if start_time != "-" else None,
+        session_end=end_time if end_time != "-" else None,
+    )
     if charge_dur is not None and charge_dur > 0:
         duration = charge_dur
         if charge_first:
@@ -2921,6 +3118,23 @@ def analyze_order_log(
     is_card_start = start_way.startswith("刷卡")
     is_vin_start = start_way.startswith("VIN")
     is_remote_start = start_way.startswith("远程")
+    # 启动结果绑定本单枪口与会话窗：拔枪后他枪/他单启动失败不计入本单
+    # 结束边界优先用账单/结算时间（启动失败文案常略晚于 IDLE）
+    session_end_for_start = (
+        (end_time if end_time != "-" else None)
+        or (order_end_ts if order_end_ts != "-" else None)
+        or unplug_ts
+    )
+    session_start_for_start = start_time if start_time != "-" else (
+        order_start_ts if order_start_ts != "-" else None
+    )
+    start_msgs_for_order = _filter_start_result_events(
+        start_result_events,
+        iface_gun=gun if gun not in (None, "", "-") else None,
+        status_gun=status_gun,
+        session_start=session_start_for_start,
+        session_end=session_end_for_start,
+    )
     start_check = _check_start_success(
         start_ok=start_ok,
         is_card_start=is_card_start,
@@ -2928,10 +3142,10 @@ def analyze_order_log(
         is_remote_start=is_remote_start,
         has_remote_cmd=bool(remote),
         gun_events=gun_events,
-        gun=gun,
+        gun=status_gun,
         socs=socs,
         chgs=chgs,
-        start_result_msgs=start_result_msgs,
+        start_result_msgs=start_msgs_for_order,
     )
     # 日志已有明确「启动失败，…」文案：结论明确，不纳入需复核的 start_mismatch
     start_result_txt = str(
